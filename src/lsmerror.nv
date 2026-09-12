@@ -1,0 +1,150 @@
+// lsmerror.nv — why a run of bytes is not the table it claimed to be,
+// and why an operation on a store will not proceed.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY FAULT NAMES A PLACE IN A FILE THE CALLER OWNS.  This package
+// reads nothing: the caller hands it bytes and it says what they are.
+// So a fault carries a table id and a byte offset rather than a path,
+// and the caller — which is the only party that knows which file the
+// id names — turns that into a message with a filename in it.
+//
+// A CORRUPT TABLE IS NAMED AT THE BLOCK, NOT AT THE FILE.  An SSTable
+// is megabytes and a checksum failure in one data block does not mean
+// the index is wrong; a store that could re-fetch that block from a
+// replica wants to know WHICH block, and one that cannot at least
+// wants the range of keys it has lost. `LsmBadBlockCrc` carries the
+// offset and the length for both.
+
+// What is wrong.
+pub enum LsmFaultKind
+    // The footer's magic is not this format's.  The first thing a
+    // reader checks, and the one that distinguishes "not an SSTable"
+    // from "a damaged SSTable".
+    LsmBadMagic(got: Int)
+    // The format version is one this build does not read.
+    LsmBadVersion(got: Int, supported: Int)
+    // A block's CRC does not match the one recorded for it.  `at` and
+    // `len` locate the block in the file.
+    LsmBadBlockCrc(at: Int, len: Int, want: Int, got: Int)
+    // The footer's CRC does not match.  A file whose footer is
+    // damaged cannot be read at all, because the footer is where the
+    // index lives.
+    LsmBadFooterCrc(want: Int, got: Int)
+    // The buffer is shorter than the structure asked for.
+    LsmShort(want: Int, have: Int)
+    // A varint ran past the end of its buffer, or encoded more than 64
+    // bits.
+    LsmBadVarint(at: Int)
+    // A block's entries are not in ascending key order.  Checked
+    // because the binary search in a data block gives a wrong answer
+    // rather than an error on an unsorted block, and a wrong answer
+    // from a store is worse than a refusal.
+    LsmUnsortedBlock(at: Int, index: Int)
+    // A key longer than `LsmOptions.max_key_len`, or a value longer
+    // than `max_value_len`.
+    LsmTooLarge(len: Int, limit: Int)
+    // A key of zero length.  Refused: an LSM's ordering is defined
+    // over non-empty keys, and an empty one is indistinguishable from
+    // the absence of a key in several of the encodings here.
+    LsmEmptyKey
+    // A write to a memtable that has been frozen.  A frozen memtable
+    // is being flushed and its contents must not move, so this is a
+    // caller mistake rather than a condition to wait on.
+    LsmMemtableFrozen
+    // A WAL record whose checksum does not match the running one.
+    // Recovery STOPS here and keeps everything before it — a torn
+    // tail is the ordinary way a crash ends a log, and discarding the
+    // whole log because its last record is half-written would lose
+    // every committed write in it.
+    LsmWalTorn(at: Int)
+    // A WAL record whose generation does not match the log's header.
+    // Left over from before the last checkpoint, because the log is
+    // written in place; recovery stops here too, and this one is not
+    // an error at all.
+    LsmWalStale(at: Int)
+    // A compaction plan naming a table the manifest does not have.
+    LsmNoSuchTable(id: Int)
+    // A merge fed a block from a reader that did not ask for one, or
+    // fed the wrong one.
+    LsmUnexpectedFeed(wanted: Int, got: Int)
+    // A level number outside the manifest's.
+    LsmNoSuchLevel(level: Int, levels: Int)
+
+// What is wrong, and which table it is about.
+pub struct LsmFault
+    // Which of the above.
+    kind: LsmFaultKind
+    // The table the fault is about, or `-1` when it is about the
+    // manifest, the WAL or a memtable.  The caller maps this to a
+    // filename; this package never sees one.
+    table: Int
+
+// A fault, built.
+//
+// ```novo
+// use lsmerror
+//
+// fn main() [io]
+//     println("${lsmerror.fault(LsmEmptyKey, 0 - 1).table}")
+// ```
+pub fn fault(kind: LsmFaultKind, table: Int) -> LsmFault []
+    todo("lsm-nv.lsmerror.fault")
+
+// The short name of a fault kind: `bad-magic`, `bad-block-crc`,
+// `wal-torn`.
+//
+// ```novo
+// use lsmerror
+//
+// fn main() [io]
+//     println(lsmerror.kind_name(LsmEmptyKey))
+// ```
+pub fn kind_name(kind: LsmFaultKind) -> Str []
+    todo("lsm-nv.lsmerror.kind_name")
+
+// One line a person can act on, naming the table and the offset.
+//
+// ```novo
+// use lsmerror
+//
+// fn main() [io]
+//     println(lsmerror.message(lsmerror.fault(LsmEmptyKey, 0 - 1)))
+// ```
+pub fn message(f: LsmFault) -> Str []
+    todo("lsm-nv.lsmerror.message")
+
+// True when the fault means the bytes on disk are damaged, as opposed
+// to the caller having asked for something impossible.
+//
+// The split a store acts on: a damaged table is a table to re-fetch,
+// rebuild or quarantine, and a caller mistake is a bug to fix.
+// `LsmWalTorn` and `LsmWalStale` are NOT corruption — both are the
+// ordinary way a log ends.
+//
+// ```novo
+// use lsmerror
+//
+// fn main() [io]
+//     println("${lsmerror.is_corruption(LsmEmptyKey)}")
+// ```
+pub fn is_corruption(kind: LsmFaultKind) -> Bool []
+    todo("lsm-nv.lsmerror.is_corruption")
+
+// True when recovery should stop at this fault and keep what it has,
+// rather than refusing the log.
+//
+// True for `LsmWalTorn` and `LsmWalStale` and false for everything
+// else.  A torn tail is how a crash ends a log; discarding the whole
+// log because its last record is half-written would lose every
+// committed write in it, which is the failure mode this predicate
+// exists to make impossible to write by accident.
+//
+// ```novo
+// use lsmerror
+//
+// fn main() [io]
+//     println("${lsmerror.ends_recovery(LsmWalTorn(4096))}")
+// ```
+pub fn ends_recovery(kind: LsmFaultKind) -> Bool []
+    todo("lsm-nv.lsmerror.ends_recovery")

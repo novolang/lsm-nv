@@ -1,0 +1,278 @@
+// lsmmem_tests.nv — the order, and the memtable built on it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: lsm-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE COMPARATOR IS ASSERTED IN BOTH DIRECTIONS, every time.  It is
+// the one function the whole package is built on and its descending
+// half is the half people write ascending; an assertion that only
+// checked `compare(a, b) < 0` would pass for a comparator that also
+// answered `compare(b, a) < 0`, which is exactly the shape a
+// hand-written one takes when the sequence branch is copied from the
+// key branch.
+
+use std.test
+use std.list
+use lsmmem
+
+@test
+fn test_keys_compare_unsigned_and_shorter_is_less() [io]
+    test.case("a byte above 127 is GREATER, not negative")
+    // A signed comparison puts 0x80 below 0x01, which sorts half the
+    // keyspace into the wrong place and is the commonest way a
+    // hand-written memcmp goes wrong.
+    test.assert(lsmmem.compare_keys([0x80], [0x01]) > 0)
+    test.assert(lsmmem.compare_keys([0x01], [0x80]) < 0)
+
+    test.case("a prefix sorts before what extends it")
+    test.assert(lsmmem.compare_keys([0x61], [0x61, 0x62]) < 0)
+    test.assert(lsmmem.compare_keys([0x61, 0x62], [0x61]) > 0)
+
+    test.case("equal keys compare equal in both directions")
+    test.assert(lsmmem.compare_keys([0x61], [0x61]) == 0)
+    test.assert(lsmmem.keys_eq([0x61], [0x61]))
+    test.assert(lsmmem.keys_eq([0x61], [0x62]) == false)
+
+    test.case("and an empty key is less than everything")
+    test.assert(lsmmem.compare_keys([], [0x00]) < 0)
+
+@test
+fn test_entries_order_by_key_then_by_sequence_descending() [io]
+    let old = lsmmem.put([0x61], [], 1)
+    let new = lsmmem.put([0x61], [], 2)
+    let other = lsmmem.put([0x62], [], 1)
+
+    test.case("a different key decides first, whatever the sequences")
+    test.assert(lsmmem.compare_entries(new, other) < 0)
+    test.assert(lsmmem.compare_entries(other, new) > 0)
+
+    test.case("the SAME key puts the HIGHER sequence FIRST")
+    test.assert(lsmmem.compare_entries(new, old) < 0)
+    test.assert(lsmmem.compare_entries(old, new) > 0)
+
+    test.case("which is what makes the first entry for a key the current one")
+    test.assert(lsmmem.compare_entries(old, old) == 0)
+
+@test
+fn test_a_tombstone_is_an_entry_and_orders_like_one() [io]
+    // A delete that removed the key instead would be a delete the next
+    // level's older copy undoes.
+    let value = lsmmem.put([0x61], [0x01], 1)
+    let gone = lsmmem.tombstone([0x61], 2)
+
+    test.case("the tombstone is newer, so it sorts first")
+    test.assert(lsmmem.compare_entries(gone, value) < 0)
+
+    test.case("it says what it is")
+    test.assert(lsmmem.is_tombstone(gone))
+    test.assert(lsmmem.is_tombstone(value) == false)
+
+    test.case("and it carries no value")
+    test.assert(list.len(gone.value) == 0)
+
+@test
+fn test_a_range_tombstone_covers_keys_that_have_no_tombstone_of_their_own() [io]
+    // Why a reader that consulted point tombstones alone would hand
+    // back a deleted key: nothing in the point-lookup path mentions a
+    // key hidden by a range delete.
+    let r = lsmmem.range_tombstone([0x61], [0x63], 5)
+
+    test.case("the low end is included")
+    test.assert(lsmmem.range_covers(r, [0x61]))
+
+    test.case("the middle is covered")
+    test.assert(lsmmem.range_covers(r, [0x62]))
+
+    test.case("the high end is NOT — the range is half-open")
+    test.assert(lsmmem.range_covers(r, [0x63]) == false)
+
+    test.case("and a key outside it is not")
+    test.assert(lsmmem.range_covers(r, [0x60]) == false)
+
+    test.case("an empty end covers to the end of the keyspace")
+    let open = lsmmem.range_tombstone([0x61], [], 5)
+    test.assert(lsmmem.range_covers(open, [0xFF, 0xFF]))
+
+@test
+fn test_prefix_end_is_the_key_that_ends_a_prefix_scan() [io]
+    test.case("the last byte increments")
+    test.assert(lsmmem.keys_eq(lsmmem.prefix_end([0x61, 0x62]), [0x61, 0x63]))
+
+    test.case("a trailing 0xFF is dropped and the byte before it increments")
+    test.assert(lsmmem.keys_eq(lsmmem.prefix_end([0x61, 0xFF]), [0x62]))
+
+    test.case("and an all-0xFF prefix has no end, which is what empty means")
+    test.assert(list.len(lsmmem.prefix_end([0xFF, 0xFF])) == 0)
+
+    test.case("so does an empty prefix, which covers everything")
+    test.assert(list.len(lsmmem.prefix_end([])) == 0)
+
+@test
+fn test_a_separator_need_not_be_a_key_that_exists() [io]
+    // The trick that makes an SSTable's index small: "application" and
+    // "apply" separate at "appli", five bytes instead of eleven.
+    let a = [0x61, 0x70, 0x70, 0x6C, 0x69, 0x63]
+    let b = [0x61, 0x70, 0x70, 0x6C, 0x79]
+    let s = lsmmem.separator(a, b)
+
+    test.case("the separator sorts between the two")
+    test.assert(lsmmem.compare_keys(a, s) <= 0)
+    test.assert(lsmmem.compare_keys(s, b) < 0)
+
+    test.case("and it is shorter than the longer of them")
+    test.assert(list.len(s) < list.len(b))
+
+    test.case("a key that is a prefix of the next has no separator")
+    test.assert(list.len(lsmmem.separator([0x61], [0x61, 0x62])) == 0)
+
+@test
+fn test_a_memtable_keeps_its_entries_sorted_so_a_flush_is_a_walk() [io]
+    let m = lsmmem.memtable()
+
+    test.case("an empty memtable holds nothing")
+    test.assert(m.bytes == 0)
+    test.assert(lsmmem.count(m) == 0)
+    test.assert(m.frozen == false)
+
+    test.case("entries go in in any order")
+    match lsmmem.insert(m, lsmmem.put([0x63], [0x01], 3))
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            match lsmmem.insert(one, lsmmem.put([0x61], [0x01], 1))
+                Err(_)  => test.assert(false)
+                Ok(two) =>
+                    test.case("and come out in order")
+                    test.assert(lsmmem.count(two) == 2)
+                    match list.nth(lsmmem.entries(two), 0)
+                        Some(e) => test.assert(lsmmem.keys_eq(e.key, [0x61]))
+                        None    => test.assert(false)
+
+                    test.case("the accounting is tracked, not recomputed")
+                    test.assert(two.bytes > 0)
+
+@test
+fn test_a_frozen_memtable_refuses_writes() [io]
+    // A flush that saw entries appear under it would write a table
+    // whose contents do not match its own footer.
+    let frozen = lsmmem.freeze(lsmmem.memtable())
+
+    test.case("it says it is frozen")
+    test.assert(frozen.frozen)
+
+    test.case("and a write is a fault rather than something to wait on")
+    match lsmmem.insert(frozen, lsmmem.put([0x61], [], 1))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_get_answers_the_newest_version_at_or_before_a_snapshot() [io]
+    var m = lsmmem.memtable()
+    match lsmmem.insert_batch(m, [lsmmem.put([0x61], [0x01], 1),
+                                  lsmmem.put([0x61], [0x02], 5)])
+        Err(_)  => test.assert(false)
+        Ok(two) =>
+            test.case("a reader at the present sees the newer version")
+            match lsmmem.get(two, [0x61], 99)
+                Some(e) => test.assert(e.seq == 5)
+                None    => test.assert(false)
+
+            test.case("a reader holding an older snapshot sees the older one")
+            test.assert(true)
+            match lsmmem.get(two, [0x61], 3)
+                Some(e) => test.assert(e.seq == 1)
+                None    => test.assert(false)
+
+            test.case("and a reader from before either sees nothing")
+            match lsmmem.get(two, [0x61], 0)
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+
+@test
+fn test_get_answers_a_tombstone_rather_than_none() [io]
+    // A caller that treated the two the same would stop the read at
+    // the memtable and never consult the levels, which is right for a
+    // tombstone and wrong for a miss.
+    match lsmmem.insert(lsmmem.memtable(), lsmmem.tombstone([0x61], 5))
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.case("a deleted key answers its tombstone")
+            match lsmmem.get(m, [0x61], 99)
+                Some(e) => test.assert(lsmmem.is_tombstone(e))
+                None    => test.assert(false)
+
+            test.case("and a key nobody wrote answers None")
+            match lsmmem.get(m, [0x62], 99)
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+
+@test
+fn test_a_scan_is_half_open_and_an_empty_end_runs_to_the_end() [io]
+    match lsmmem.insert_batch(lsmmem.memtable(),
+                              [lsmmem.put([0x61], [], 1),
+                               lsmmem.put([0x62], [], 2),
+                               lsmmem.put([0x63], [], 3)])
+        Err(_) => test.assert(false)
+        Ok(m)  =>
+            test.case("the low end is included and the high end is not")
+            test.assert(list.len(lsmmem.scan(m, [0x61], [0x63], 99)) == 2)
+
+            test.case("an empty end runs to the end")
+            test.assert(list.len(lsmmem.scan(m, [0x61], [], 99)) == 3)
+
+            test.case("and a snapshot bounds it too")
+            test.assert(list.len(lsmmem.scan(m, [0x61], [], 2)) == 2)
+
+@test
+fn test_a_memtable_knows_when_it_is_full_and_what_it_spans() [io]
+    let o = lsmmem.default_options()
+
+    test.case("an empty one is not full")
+    test.assert(lsmmem.should_flush(lsmmem.memtable(), o) == false)
+
+    test.case("the defaults are LevelDB's, and the block size is 4 KB")
+    test.assert(o.block_bytes == 4096)
+    test.assert(o.l0_trigger == 4)
+    test.assert(o.level_multiplier == 10)
+    test.assert(o.bloom_bits_per_key == 10)
+
+    test.case("an empty memtable's range is two empty keys")
+    let r = lsmmem.key_range(lsmmem.memtable())
+    test.assert(list.len(r.smallest) == 0)
+    test.assert(list.len(r.largest) == 0)
+
+@test
+fn test_a_range_is_inclusive_at_both_ends_and_ranges_overlap_by_a_key() [io]
+    // Inclusive because that is what a table's own range is — the
+    // smallest and largest keys it actually contains — and mixing it
+    // with a half-open scan range is wrong by one key at the boundary.
+    let a = lsmmem.range([0x61], [0x63])
+    let b = lsmmem.range([0x63], [0x65])
+    let c = lsmmem.range([0x64], [0x66])
+
+    test.case("a range holds both its ends")
+    test.assert(lsmmem.range_holds(a, [0x61]))
+    test.assert(lsmmem.range_holds(a, [0x63]))
+    test.assert(lsmmem.range_holds(a, [0x64]) == false)
+
+    test.case("two ranges touching at one key DO overlap")
+    test.assert(lsmmem.ranges_overlap(a, b))
+    test.assert(lsmmem.ranges_overlap(b, a))
+
+    test.case("and two that do not share a key do not")
+    test.assert(lsmmem.ranges_overlap(a, c) == false)
+
+    test.case("a union spans both")
+    let u = lsmmem.ranges_union(a, c)
+    test.assert(lsmmem.keys_eq(u.smallest, [0x61]))
+    test.assert(lsmmem.keys_eq(u.largest, [0x66]))
+
+@test
+fn test_entry_bytes_counts_what_a_memtable_is_accounting_for() [io]
+    test.case("a put counts its key and its value")
+    let small = lsmmem.entry_bytes(lsmmem.put([0x61], [0x01], 1))
+    let larger = lsmmem.entry_bytes(lsmmem.put([0x61], [0x01, 0x02], 1))
+    test.assert(larger > small)
+
+    test.case("and a tombstone counts less than the put it replaces")
+    test.assert(lsmmem.entry_bytes(lsmmem.tombstone([0x61], 1)) < small)

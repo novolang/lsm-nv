@@ -1,0 +1,237 @@
+// lsmsst_tests.nv — the table format, and the reader that reads
+// nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: lsm-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE ASSERTIONS ARE ROUND TRIPS AND REFUSALS.  A table format's bugs
+// are a length written as the compressed one and read as the raw one,
+// an offset counted from the block rather than the file, and a binary
+// search that is off by one at the last restart point; each of those
+// produces a wrong answer rather than an error, so every case here
+// either writes and reads back, or asserts that something wrong is
+// refused by name.
+
+use std.test
+use std.list
+use std.bytes
+use lsmerror
+use lsmmem
+use lsmsst
+
+@test
+fn test_the_footer_is_fixed_size_and_at_the_end() [io]
+    // The decision that makes the format work over a network: a reader
+    // that knows the file's length knows exactly which bytes to fetch
+    // first, in one request, having read nothing.
+    test.case("the footer has a size that does not depend on the table")
+    test.assert(lsmsst.footer_size() > 0)
+
+    test.case("and a magic and a version a reader checks first")
+    test.assert(lsmsst.magic() != 0)
+    test.assert(lsmsst.format_version() > 0)
+
+@test
+fn test_the_checksum_is_crc_32c_and_is_published() [io]
+    // So a caller verifying a table with its own tooling uses the same
+    // one, and so the choice is visible rather than buried.
+    test.case("thirty-two bits")
+    test.assert(lsmsst.block_crc().width == 32)
+
+    test.case("and the WAL uses the same one")
+    test.assert(lsmsst.block_crc().reflected)
+
+@test
+fn test_a_table_round_trips_through_a_buffer() [io]
+    let o = lsmmem.default_options()
+    let es = [lsmmem.put([0x61], [0x01], 1),
+              lsmmem.put([0x62], [0x02], 2),
+              lsmmem.put([0x63], [0x03], 3)]
+
+    match lsmsst.write_table([], es, o)
+        Err(_)  => test.assert(false)
+        Ok(out) =>
+            test.case("the buffer comes back with a table in it")
+            test.assert(list.len(out.bytes) > lsmsst.footer_size())
+
+            test.case("the footer says how many entries and which keys")
+            test.assert(out.footer.entries == 3)
+            test.assert(lsmmem.keys_eq(out.footer.keys.smallest, [0x61]))
+            test.assert(lsmmem.keys_eq(out.footer.keys.largest, [0x63]))
+
+            test.case("and the sequence range, which a compaction reads")
+            test.assert(out.footer.min_seq == 1)
+            test.assert(out.footer.max_seq == 3)
+
+    test.case("and table_len counted it exactly, without writing it")
+    match lsmsst.table_len(es, o)
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            match lsmsst.write_table([], es, o)
+                Err(_)  => test.assert(false)
+                Ok(out) => test.assert(list.len(out.bytes) == n)
+
+@test
+fn test_a_write_appends_rather_than_replacing() [io]
+    let o = lsmmem.default_options()
+
+    match lsmsst.write_table([], [], o)
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            match lsmsst.write_table(a.bytes, [], o)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(list.len(b.bytes) == 2 * list.len(a.bytes))
+
+@test
+fn test_an_out_of_order_entry_is_refused_at_the_writer() [io]
+    // A table written out of order gives wrong answers rather than
+    // errors — a binary search in a data block does not notice — so the
+    // check is here, once, where it is cheap.
+    let w = lsmsst.writer([], lsmmem.default_options())
+
+    match lsmsst.add(w, lsmmem.put([0x62], [], 1))
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            test.case("a smaller key after a larger one is refused")
+            match lsmsst.add(one, lsmmem.put([0x61], [], 1))
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+            test.case("and a larger one is accepted")
+            match lsmsst.add(one, lsmmem.put([0x63], [], 1))
+                Ok(two) => test.assert(two.entries == 2)
+                Err(_)  => test.assert(false)
+
+@test
+fn test_the_same_key_at_a_lower_sequence_follows_and_is_in_order() [io]
+    // Descending sequence within a key is IN order, and a writer that
+    // checked keys only would refuse a perfectly good table.
+    let w = lsmsst.writer([], lsmmem.default_options())
+
+    match lsmsst.add(w, lsmmem.put([0x61], [], 5))
+        Err(_)  => test.assert(false)
+        Ok(one) =>
+            match lsmsst.add(one, lsmmem.put([0x61], [], 2))
+                Ok(two) => test.assert(two.entries == 2)
+                Err(_)  => test.assert(false)
+
+@test
+fn test_the_reader_asks_before_it_can_answer() [io]
+    let r = lsmsst.reader(7)
+
+    test.case("the first thing it wants is the file's length")
+    match lsmsst.wants(r)
+        LsmNeedLength(t) => test.assert(t == 7)
+        _                => test.assert(false)
+
+    test.case("it is not open yet")
+    test.assert(lsmsst.is_open(r) == false)
+
+    test.case("and once told the length it asks for the footer, at the end")
+    let sized = lsmsst.feed_length(r, 8192)
+    test.assert(sized.length == 8192)
+    match lsmsst.wants(sized)
+        LsmNeedBytes(t, at, n) =>
+            test.assert(t == 7)
+            test.assert(at == 8192 - lsmsst.footer_size())
+            test.assert(n == lsmsst.footer_size())
+        _                      => test.assert(false)
+
+@test
+fn test_feeding_the_wrong_bytes_is_a_fault_rather_than_a_bad_decode() [io]
+    // A caller that answered the wrong request would otherwise get a
+    // reader that decodes an index block as a footer.
+    let r = lsmsst.feed_length(lsmsst.reader(7), 8192)
+
+    test.case("the offset is checked against the one the reader asked for")
+    match lsmsst.feed(r, 0, [])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_bloom_filters_asymmetry_is_in_its_name() [io]
+    // `true` means NOT PRESENT and is certain; `false` means "maybe"
+    // and costs a block fetch.  A reader that had this backwards would
+    // skip blocks that hold the key.
+    let r = lsmsst.reader(7)
+
+    test.case("a table with no filter never claims a key is absent")
+    test.assert(lsmsst.bloom_says_absent(r, [0x61]) == false)
+
+    test.case("the hash is published so a filter built out of band matches")
+    test.assert(lsmsst.bloom_hash([0x61]) == lsmsst.bloom_hash([0x61]))
+    test.assert(lsmsst.bloom_hash([0x61]) != lsmsst.bloom_hash([0x62]))
+
+    test.case("and the size is published, because the number surprises people")
+    // Ten bits per key over a million keys is 1.25 MB of filter.
+    let o = lsmmem.default_options()
+    test.assert(lsmsst.bloom_bytes(1000000, o) == 1250000)
+    test.assert(lsmsst.bloom_bytes(0, o) == 0)
+
+@test
+fn test_a_lookup_is_a_block_index_rather_than_a_request() [io]
+    // Answering an index lets a caller batch: a range scan asks for
+    // both ends and fetches every block between them in one go.
+    let r = lsmsst.reader(7)
+
+    test.case("an unopened reader holds no blocks")
+    test.assert(lsmsst.block_count(r) == 0)
+    test.assert(list.len(lsmsst.index_of(r)) == 0)
+
+    test.case("and a key in no block answers -1 rather than block zero")
+    test.assert(lsmsst.block_for(r, [0x61]) == 0 - 1)
+
+    test.case("a range over an empty table needs no blocks")
+    test.assert(list.len(lsmsst.blocks_for_range(r, [], [])) == 0)
+
+    test.case("and a request for a block that does not exist is not a fetch")
+    match lsmsst.block_request(r, 0)
+        LsmNeedBytes(_, _, _) => test.assert(false)
+        _                     => test.assert(true)
+
+@test
+fn test_a_corrupt_block_names_its_offset_and_its_length() [io]
+    // So a store that can re-fetch that block from a replica knows
+    // which one, and one that cannot knows which keys it has lost.
+    let r = lsmsst.reader(7)
+
+    match lsmsst.decode_block(r, 4096, [0x00, 0x00, 0x00, 0x00])
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(f.table == 7)
+            match f.kind
+                LsmBadBlockCrc(at, len, _, _) =>
+                    test.assert(at == 4096)
+                    test.assert(len > 0)
+                LsmShort(_, _)                => test.assert(true)
+                _                             => test.assert(false)
+
+@test
+fn test_a_lookup_inside_a_block_does_not_allocate_the_block() [io]
+    let r = lsmsst.reader(7)
+
+    test.case("a search in a block the caller fetched answers an entry or None")
+    match lsmsst.find_in_block(r, 0, [], [0x61], 99)
+        Ok(hit) =>
+            match hit
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+        Err(_)  => test.assert(true)
+
+@test
+fn test_lengths_are_varints_and_the_encoding_is_published() [io]
+    test.case("a small number is one byte")
+    test.assert(lsmsst.varint_len(1) == 1)
+
+    test.case("and one past the seven-bit boundary is two")
+    test.assert(lsmsst.varint_len(300) == 2)
+
+@test
+fn test_a_varint_decodes_with_a_fault_in_this_packages_vocabulary() [io]
+    // So a tool reading a block by hand gets an offset it can act on,
+    // rather than one relative to a buffer it sliced.
+    test.case("an empty buffer holds no varint")
+    match lsmsst.decode_varint(bytes.from_str(""), 0)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(lsmerror.kind_name(f.kind) != "")

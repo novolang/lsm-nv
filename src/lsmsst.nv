@@ -1,0 +1,550 @@
+// lsmsst.nv — the sorted string table: a writer into a caller's
+// buffer, and a reader that asks the caller for byte ranges.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE FILE FORMAT, SMALLEST TO LARGEST
+//
+//   data block    entries, prefix-compressed against the previous key
+//                 within a restart group, then a restart array of
+//                 offsets and its count, then a 4-byte CRC.
+//   bloom block   `bloom_bits_per_key` bits per key, or absent.
+//   index block   one entry per data block: a separator key (see
+//                 `lsmmem.separator`), the block's offset, its length.
+//                 Same block encoding as a data block, so one decoder
+//                 reads both.
+//   footer        fixed size, last in the file: the offsets and
+//                 lengths of the index and bloom blocks, the entry
+//                 count, the sequence range, a version, a CRC and a
+//                 magic.
+//
+// It is LevelDB's layout, chosen because it is the reference the plan
+// names and because its one unusual decision — a FIXED-SIZE FOOTER AT
+// THE END — is the decision that makes the whole thing work over a
+// network or a mapped file: a reader that knows the file's length
+// knows exactly which bytes to fetch first, in one request, without
+// having read anything.
+//
+// THE READER ASKS, THE CALLER PERFORMS.  `open` answers a request for
+// the footer; `feed` hands the bytes back; the reader then asks for
+// the index block, and then for one data block per lookup.  Nothing
+// here reads a file, and the same reader serves a file on disk, a
+// blob in object storage and a fixture a test built in memory —
+// because the only thing that differs between those is who answers
+// `LsmNeedBytes`.  btree-nv's `PageRequest` is the same shape for the
+// same reason; this one asks for byte RANGES rather than pages,
+// because an SSTable's blocks are variable length.
+//
+// THE CHECKSUM IS crc-nv's AND THE LENGTHS ARE varint-nv's, and both
+// are dependencies rather than copies: a CRC table transcribed twice
+// is a CRC table that differs in one entry, and a varint written twice
+// is two decoders that disagree about a 64-bit boundary.
+
+use crc
+use varint
+use lsmerror
+use lsmmem
+
+// What a reader needs before it can answer.
+pub enum LsmRequest
+    // Nothing; the reader can proceed.
+    LsmReady
+    // These bytes of this table, please.  `at` is an absolute offset
+    // and `len` a byte count; a reader that knows the file's length
+    // never asks past the end.
+    LsmNeedBytes(table: Int, at: Int, len: Int)
+    // The file's length.  Asked once, by `open`, because the footer is
+    // at the end and there is no other way to find it.
+    LsmNeedLength(table: Int)
+
+// A reader part-way through a table.
+//
+// Opaque: the fields are a decoder's state and a caller that read them
+// would be depending on a representation this package intends to
+// change once it is measured.
+pub struct LsmReader
+    // Which table this reads.  The caller maps it to a file.
+    table: Int
+    // The file's length, or `-1` before it has been fed.
+    length: Int
+    // The footer, once read.
+    footer: LsmFooter
+    // The index block's entries, once read.
+    index: [LsmIndexEntry]
+    // The bloom filter's bits, once read; empty when the table has
+    // none.
+    bloom: [u8]
+    // What the reader is waiting for.
+    want: LsmRequest
+
+// The fixed-size trailer every table ends with.
+pub struct LsmFooter
+    // The format version this file was written at.
+    version: Int
+    // Where the index block starts.
+    index_at: Int
+    // How long it is.
+    index_len: Int
+    // Where the bloom block starts, or `-1` when there is none.
+    bloom_at: Int
+    // How long it is, or `0`.
+    bloom_len: Int
+    // How many entries the table holds, versions included.
+    entries: Int
+    // The smallest and largest keys in the table.
+    keys: lsmmem.LsmRange
+    // The lowest sequence number in the table.  A compaction that can
+    // see every table whose sequence range reaches below a snapshot
+    // knows it may drop older versions, and this is how it knows.
+    min_seq: Int
+    // The highest.
+    max_seq: Int
+
+// One entry of the index block: which data block holds keys up to a
+// separator.
+pub struct LsmIndexEntry
+    // A key greater than or equal to every key in this block and less
+    // than every key in the next — `lsmmem.separator`'s answer, which
+    // need not be a key that exists.
+    separator: [u8]
+    // Where the block starts.
+    at: Int
+    // How long it is, CRC included.
+    len: Int
+
+// What a table write produced.
+pub struct LsmWritten
+    // The buffer, with the table appended.
+    bytes: [u8]
+    // The footer, so a caller can record the table in a manifest
+    // without reading back what it just wrote.
+    footer: LsmFooter
+
+// A writer part-way through a table.
+pub struct LsmWriter
+    // The buffer being appended to.
+    bytes: [u8]
+    // The options the table is being written under.
+    options: lsmmem.LsmOptions
+    // The index entries accumulated so far.
+    index: [LsmIndexEntry]
+    // The key hashes accumulated for the bloom filter.
+    hashes: [Int]
+    // How many entries have been added.
+    entries: Int
+    // The last key added, for the ordering check and for prefix
+    // compression.
+    last_key: [u8]
+    // The lowest and highest sequence numbers seen.
+    min_seq: Int
+    max_seq: Int
+
+// ── writing ──────────────────────────────────────────────────────────
+
+// A writer appending to `out`.
+//
+// ```novo
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.writer([], lsmmem.default_options()).entries}")
+// ```
+pub fn writer(out: [u8], o: lsmmem.LsmOptions) -> LsmWriter []
+    todo("lsm-nv.lsmsst.writer")
+
+// `w` with `e` appended.
+//
+// Entries must arrive in `lsmmem.compare_entries` order and the writer
+// REFUSES one that does not, with the index of the offending entry.
+// A table written out of order gives wrong answers rather than errors
+// — a binary search in a data block does not notice — so the check is
+// here, once, where it is cheap, rather than nowhere.
+//
+// ```novo
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     let w = lsmsst.writer([], lsmmem.default_options())
+//     match lsmsst.add(w, lsmmem.put([], [], 1))
+//         Ok(next) => println("${next.entries}")
+//         Err(_)   => println("out of order")
+// ```
+pub fn add(w: LsmWriter, e: lsmmem.LsmEntry) -> Result<LsmWriter, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.add")
+
+// `w` finished: the last data block closed, the bloom and index
+// blocks written, the footer appended.
+//
+// ```novo
+// use std.list
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.finish(lsmsst.writer([], lsmmem.default_options()))
+//         Ok(out) => println("${list.len(out.bytes)}")
+//         Err(_)  => println("no")
+// ```
+pub fn finish(w: LsmWriter) -> Result<LsmWritten, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.finish")
+
+// A whole table from a sorted list of entries, appended to `out`.
+//
+// `writer` / `add` / `finish` in one call, for the flush path where
+// the entries are a memtable's and are already in order and already in
+// memory.
+//
+// ```novo
+// use std.list
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.write_table([], [], lsmmem.default_options())
+//         Ok(out) => println("${list.len(out.bytes)}")
+//         Err(_)  => println("no")
+// ```
+pub fn write_table(out: [u8], es: [lsmmem.LsmEntry],
+                   o: lsmmem.LsmOptions) -> Result<LsmWritten, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.write_table")
+
+// How many bytes `write_table` will append, without appending them.
+//
+// Exact: the same walk, counting.  What a caller pre-allocating a
+// buffer or deciding whether a compaction's output fits on the device
+// asks.
+//
+// ```novo
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.table_len([], lsmmem.default_options())
+//         Ok(n)  => println("${n}")
+//         Err(_) => println("no")
+// ```
+pub fn table_len(es: [lsmmem.LsmEntry], o: lsmmem.LsmOptions) -> Result<Int, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.table_len")
+
+// The size of the footer, in bytes.  Fixed for a given format version,
+// which is what lets a reader fetch it in one request.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.footer_size()}")
+// ```
+pub fn footer_size() -> Int []
+    todo("lsm-nv.lsmsst.footer_size")
+
+// The four magic bytes every table ends with, as an integer.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.magic()}")
+// ```
+pub fn magic() -> Int []
+    todo("lsm-nv.lsmsst.magic")
+
+// The format version this build writes.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.format_version()}")
+// ```
+pub fn format_version() -> Int []
+    todo("lsm-nv.lsmsst.format_version")
+
+// The CRC this package checksums blocks with: crc-nv's CRC-32C.
+//
+// Published so a caller verifying a table with its own tooling uses
+// the same one, and so the choice is visible rather than buried: 32C
+// because it has hardware support on both architectures this runs on,
+// and because crc-nv already carries it.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.block_crc().width}")
+// ```
+pub fn block_crc() -> crc.Crc []
+    todo("lsm-nv.lsmsst.block_crc")
+
+// ── reading ──────────────────────────────────────────────────────────
+
+// A reader for table `id`, which needs the file's length first.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.reader(7).table}")
+// ```
+pub fn reader(id: Int) -> LsmReader []
+    todo("lsm-nv.lsmsst.reader")
+
+// What `r` is waiting for.
+//
+// The loop a caller writes: ask, fetch, feed, ask again, until
+// `LsmReady`.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.wants(lsmsst.reader(7))
+//         LsmNeedLength(t) => println("${t}")
+//         _                => println("something else")
+// ```
+pub fn wants(r: LsmReader) -> LsmRequest []
+    todo("lsm-nv.lsmsst.wants")
+
+// `r` told how long the file is.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.feed_length(lsmsst.reader(7), 4096).length}")
+// ```
+pub fn feed_length(r: LsmReader, length: Int) -> LsmReader []
+    todo("lsm-nv.lsmsst.feed_length")
+
+// `r` handed the bytes it asked for.
+//
+// The offset and length are passed back so the reader can check they
+// are the ones it wanted — a caller that answered the wrong request
+// gets `LsmUnexpectedFeed` rather than a reader that decodes an index
+// block as a footer.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.feed(lsmsst.reader(7), 0, [])
+//         Ok(next) => println("${next.length}")
+//         Err(_)   => println("wrong bytes")
+// ```
+pub fn feed(r: LsmReader, at: Int, bytes: [u8]) -> Result<LsmReader, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.feed")
+
+// True when `r` has its footer and index and can answer lookups.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.is_open(lsmsst.reader(7))}")
+// ```
+pub fn is_open(r: LsmReader) -> Bool []
+    todo("lsm-nv.lsmsst.is_open")
+
+// The table's footer, once it is open.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.footer(lsmsst.reader(7)).entries}")
+// ```
+pub fn footer(r: LsmReader) -> LsmFooter []
+    todo("lsm-nv.lsmsst.footer")
+
+// Which data block could hold `key`, as an index into the table's
+// index entries, or `-1` when no block could.
+//
+// A binary search over the separators.  Answering an index rather than
+// a request is what lets a caller batch: a scan over a range asks this
+// for both ends and fetches every block between them in one go.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.block_for(lsmsst.reader(7), [])}")
+// ```
+pub fn block_for(r: LsmReader, key: [u8]) -> Int []
+    todo("lsm-nv.lsmsst.block_for")
+
+// The request that fetches data block `i`.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.block_request(lsmsst.reader(7), 0)
+//         LsmNeedBytes(t, at, n) => println("${t} ${at} ${n}")
+//         _                      => println("no such block")
+// ```
+pub fn block_request(r: LsmReader, i: Int) -> LsmRequest []
+    todo("lsm-nv.lsmsst.block_request")
+
+// The entries in a data block the caller has fetched, in order.
+//
+// The CRC is checked first and a mismatch names the block's offset and
+// length, so a store that can re-fetch that block from a replica knows
+// which one, and one that cannot knows which keys it has lost.
+//
+// ```novo
+// use std.list
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.decode_block(lsmsst.reader(7), 0, [])
+//         Ok(es) => println("${list.len(es)}")
+//         Err(_) => println("corrupt")
+// ```
+pub fn decode_block(r: LsmReader, at: Int,
+                    bytes: [u8]) -> Result<[lsmmem.LsmEntry], lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.decode_block")
+
+// The newest entry for `key` at or before `at_seq` in a block the
+// caller has fetched, or `None`.
+//
+// `decode_block` then a scan would do the same thing and allocate
+// every entry in the block to find one; this searches in place.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.find_in_block(lsmsst.reader(7), 0, [], [], 99)
+//         Ok(hit) =>
+//             match hit
+//                 Some(_) => println("found")
+//                 None    => println("not in this block")
+//         Err(_) => println("corrupt")
+// ```
+pub fn find_in_block(r: LsmReader, at: Int, bytes: [u8], key: [u8],
+                     at_seq: Int) -> Result<?lsmmem.LsmEntry, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.find_in_block")
+
+// True when the table's bloom filter says `key` is definitely absent.
+//
+// The asymmetry is the whole point and the name says which way round
+// it goes: `true` means NOT PRESENT and is certain; `false` means
+// "maybe" and costs a block fetch.  A reader that had this backwards
+// would skip blocks that hold the key, which is a wrong answer rather
+// than a slow one.
+//
+// Answers `false` for a table with no filter, so a caller never has to
+// ask whether there is one.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.bloom_says_absent(lsmsst.reader(7), [])}")
+// ```
+pub fn bloom_says_absent(r: LsmReader, key: [u8]) -> Bool []
+    todo("lsm-nv.lsmsst.bloom_says_absent")
+
+// The indices of every data block that could hold a key in
+// `[from, to)`, in order.
+//
+// What a range scan fetches.  An empty `to` runs to the end of the
+// table.
+//
+// ```novo
+// use std.list
+// use lsmsst
+//
+// fn main() [io]
+//     println("${list.len(lsmsst.blocks_for_range(lsmsst.reader(7), [], []))}")
+// ```
+pub fn blocks_for_range(r: LsmReader, from: [u8], to: [u8]) -> [Int] []
+    todo("lsm-nv.lsmsst.blocks_for_range")
+
+// How many data blocks the table has.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.block_count(lsmsst.reader(7))}")
+// ```
+pub fn block_count(r: LsmReader) -> Int []
+    todo("lsm-nv.lsmsst.block_count")
+
+// The index entries, for a tool that wants to show a table's shape.
+//
+// ```novo
+// use std.list
+// use lsmsst
+//
+// fn main() [io]
+//     println("${list.len(lsmsst.index_of(lsmsst.reader(7)))}")
+// ```
+pub fn index_of(r: LsmReader) -> [LsmIndexEntry] []
+    todo("lsm-nv.lsmsst.index_of")
+
+// How many bits a bloom filter for `keys` keys takes at
+// `o.bloom_bits_per_key`, rounded up to a byte.
+//
+// Published because a caller sizing a table's total footprint needs
+// it, and because the number surprises people: at ten bits per key a
+// million keys is 1.25 MB of filter, which is the memory a store pays
+// to avoid a disk read.
+//
+// ```novo
+// use lsmmem
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.bloom_bytes(1000, lsmmem.default_options())}")
+// ```
+pub fn bloom_bytes(keys: Int, o: lsmmem.LsmOptions) -> Int []
+    todo("lsm-nv.lsmsst.bloom_bytes")
+
+// The bloom filter's hash of `key` — the one the writer and the reader
+// must agree on.
+//
+// Published so a caller building a filter out of band uses the same
+// function, and because a filter whose hash changed between two builds
+// is a filter that reports every key absent.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.bloom_hash([])}")
+// ```
+pub fn bloom_hash(key: [u8]) -> Int []
+    todo("lsm-nv.lsmsst.bloom_hash")
+
+// The length prefix `n` encodes to, in varint-nv's encoding — the one
+// this format uses for every key length, value length and offset.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     println("${lsmsst.varint_len(300)}")
+// ```
+pub fn varint_len(n: Int) -> Int []
+    todo("lsm-nv.lsmsst.varint_len")
+
+// The varint at `off`, and how many bytes it took.
+//
+// varint-nv's own decoder, with a fault in this package's vocabulary
+// so a tool reading a block by hand gets an offset it can act on
+// rather than one relative to a buffer it sliced.
+//
+// ```novo
+// use lsmsst
+//
+// fn main() [io]
+//     match lsmsst.decode_varint(bytes.from_str(""), 0)
+//         Ok(d)  => println("${d.value}")
+//         Err(_) => println("not a varint")
+// ```
+pub fn decode_varint(bytes: Bytes, off: Int) -> Result<varint.Decoded, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmsst.decode_varint")

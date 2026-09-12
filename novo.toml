@@ -1,0 +1,78 @@
+[package]
+name        = "lsm-nv"
+version     = "0.0.1"
+description = "A log-structured merge tree as arithmetic over blocks the caller stores: a sorted memtable, an SSTable format with blocks, an index, a bloom filter and a crc-nv footer written into a caller's buffer, a reader that asks for byte ranges instead of reading them, a manifest of levels with a compaction planner, a merge iterator fed by the caller, and a write-ahead log whose recovery stops in the right place.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`, and it is the half of a storage engine that can be.  Nothing
+# here opens a file, syncs one, takes a lock or starts a thread: a
+# writer appends to a caller's buffer, a reader answers a request for
+# a byte range, and a compaction answers a PLAN rather than running
+# one.  That is what makes a compaction policy testable — a test
+# builds a manifest, asks for a plan and asserts on the answer, with no
+# file, no thread and no timing in it — and it is what lets the same
+# code serve a file on disk, a blob in object storage and a fixture
+# built in memory.
+#
+# The `host` half is a separate row and is named in the README: it
+# owns the files, the fsync, the background compaction thread and the
+# snapshot registry.
+#
+# NO `tests/embedded_probe.nv`, and the absence is a claim not made
+# rather than a claim skipped.  A memtable is a list of entries each
+# holding two heap byte strings, and a bloom filter at ten bits per key
+# is more memory than a microcontroller has.  A device that logs to
+# flash wants a ring buffer, which is bbqueue-nv.
+layer       = "core"
+
+category    = "databases"
+
+tags        = ["lsm", "sstable", "leveldb", "rocksdb", "storage-engine", "compaction", "wal", "sans-io"]
+repository  = "https://github.com/novolang/lsm-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A log-structured merge tree over blocks the caller stores"
+
+[dependencies]
+# Two `core` dependencies, both of them tables that should exist once
+# on this registry rather than twice.
+#
+# crc-nv is the checksum on every data block, on the index, on the
+# footer and on every WAL record.  CRC-32C, because it has hardware
+# support on both architectures this runs on and because crc-nv
+# already carries it with its published check value.  A CRC table
+# transcribed a second time is a CRC table that differs in one entry,
+# and the difference shows up as a corrupt-file report on a file that
+# is fine.
+#
+# varint-nv is every length and offset in the SSTable format and in
+# the WAL.  A varint written twice is two decoders that disagree about
+# a 64-bit boundary, which is a class of bug that only appears on the
+# large values nobody's fixtures have.
+#
+# NOT pager-nv, and the absence is the point of the README's section
+# on the WAL: pager-nv is `host` and this is `core`, so the two cannot
+# be related by a dependency at all.  What they share is the SHAPE of
+# a write-ahead log — a generation rather than a truncation, a
+# cumulative checksum, and the commit marker inside the record — and
+# that is named in `lsmwal`'s module comment rather than imported.
+#
+# NOT btree-nv either.  Its `PageRequest` is the same idea as
+# `LsmRequest` and the two are deliberately separate: a B-tree asks
+# for fixed-size PAGES and an SSTable asks for variable-length byte
+# RANGES, and one enum covering both would have a field that is
+# meaningless in half its uses.
+crc-nv    = "^0.1.4"
+varint-nv = "^0.1.4"

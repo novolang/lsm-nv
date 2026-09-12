@@ -1,0 +1,240 @@
+// lsmmerge_tests.nv — which version wins, and what may be dropped.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: lsm-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// EVERY CASE HERE IS A WRONG ANSWER RATHER THAN AN ERROR IF IT FAILS.
+// A merge that picks the older version returns stale data; one that
+// drops a tombstone too early resurrects a deleted key; one that
+// forgets a range tombstone returns a key nobody can see with a point
+// lookup.  None of the three raises anything anywhere, which is why
+// `would_drop` is published: the decision has to be observable without
+// running a compaction and diffing the output.
+
+use std.test
+use std.list
+use lsmmem
+use lsmlevel
+use lsmmerge
+
+@test
+fn test_the_newer_version_of_a_key_wins() [io]
+    let older = [lsmmem.put([0x61], [0x01], 1)]
+    let newer = [lsmmem.put([0x61], [0x02], 5)]
+
+    test.case("source 0 is newest, so it wins whatever the sequences")
+    let out = lsmmerge.merge_all([newer, older], 0, false)
+    test.assert(list.len(out) > 0)
+    match list.nth(out, 0)
+        Some(e) => test.assert(e.seq == 5)
+        None    => test.assert(false)
+
+    test.case("and newest_of answers the same version for a point read")
+    match lsmmerge.newest_of([newer, older], [0x61], 99)
+        Some(e) => test.assert(e.seq == 5)
+        None    => test.assert(false)
+
+@test
+fn test_a_snapshot_below_the_newer_version_keeps_the_older_one() [io]
+    // A compaction may drop an older version only when no live reader
+    // sits between it and the newer one.
+    let a = [lsmmem.put([0x61], [0x01], 1)]
+    let b = [lsmmem.put([0x61], [0x02], 5)]
+
+    test.case("with no readers, only the newest survives")
+    test.assert(list.len(lsmmerge.merge_all([b, a], 99, false)) == 1)
+
+    test.case("with a reader at 3, both do")
+    test.assert(list.len(lsmmerge.merge_all([b, a], 3, false)) == 2)
+
+@test
+fn test_a_reader_holding_a_snapshot_sees_the_version_it_pinned() [io]
+    let versions = [lsmmem.put([0x61], [0x02], 5), lsmmem.put([0x61], [0x01], 1)]
+
+    test.case("a reader at the present sees the newest")
+    match lsmmerge.newest_of([versions], [0x61], 99)
+        Some(e) => test.assert(e.seq == 5)
+        None    => test.assert(false)
+
+    test.case("a reader at 3 sees the one that was current then")
+    match lsmmerge.newest_of([versions], [0x61], 3)
+        Some(e) => test.assert(e.seq == 1)
+        None    => test.assert(false)
+
+    test.case("and one from before either sees nothing")
+    match lsmmerge.newest_of([versions], [0x61], 0)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_tombstone_is_kept_unless_the_merge_is_told_it_may_drop_it() [io]
+    // The second load-bearing rule. A tombstone dropped anywhere but
+    // the bottom level resurrects the key from the copy below.
+    let gone = [lsmmem.tombstone([0x61], 5)]
+    let value = [lsmmem.put([0x61], [0x01], 1)]
+
+    test.case("not at the bottom: the tombstone survives, the value does not")
+    let kept = lsmmerge.merge_all([gone, value], 99, false)
+    test.assert(list.len(kept) == 1)
+    for e in kept
+        test.assert(lsmmem.is_tombstone(e))
+
+    test.case("at the bottom: both go, because nothing below can hold the key")
+    test.assert(list.len(lsmmerge.merge_all([gone, value], 99, true)) == 0)
+
+@test
+fn test_the_tombstone_answer_travels_from_the_planner_to_the_merge() [io]
+    // So the fact does not get restated by a caller, which is the step
+    // at which `true` gets passed by mistake.
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    let p = lsmlevel.pick_with(m, lsmmem.default_options(), 7)
+    let merge = lsmmerge.merge_for(p)
+
+    test.case("as many sources as the plan has inputs")
+    test.assert(merge.sources == list.len(p.inputs))
+
+    test.case("the snapshot boundary came with it")
+    test.assert(merge.oldest_snapshot == 7)
+
+    test.case("and so did the tombstone answer, unchanged")
+    test.assert(merge.drop_tombstones == lsmlevel.plan_may_drop_tombstones(p))
+
+@test
+fn test_would_drop_makes_the_invisible_decision_observable() [io]
+    // A version dropped too early is a read that answers wrong, and a
+    // test that could only observe this through `step` would have to
+    // reconstruct the state.
+    let m = lsmmerge.merge(2, 99, false)
+
+    test.case("a tombstone is not dropped by a merge that may not drop one")
+    test.assert(lsmmerge.would_drop(m, lsmmem.tombstone([0x61], 5)) == false)
+
+    test.case("and one that may, does")
+    let bottom = lsmmerge.merge(2, 99, true)
+    test.assert(lsmmerge.would_drop(bottom, lsmmem.tombstone([0x61], 5)))
+
+    test.case("and there is a line saying why, for a log")
+    test.assert(lsmmerge.drop_reason(bottom, lsmmem.tombstone([0x61], 5)) != "")
+
+@test
+fn test_the_merge_asks_for_a_source_rather_than_pulling_from_it() [io]
+    let m = lsmmerge.merge(2, 99, false)
+
+    test.case("a fresh merge wants source 0")
+    match lsmmerge.step(m).what
+        LsmMergeWant(i) => test.assert(i == 0)
+        _               => test.assert(false)
+    test.assert(lsmmerge.waiting_for(m) == 0)
+
+    test.case("it is not done")
+    test.assert(lsmmerge.is_done(m) == false)
+
+    test.case("and a source index it does not have is a fault")
+    match lsmmerge.feed(m, 5, [])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match lsmmerge.close(m, 5)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_closing_a_source_is_not_the_same_as_feeding_it_nothing() [io]
+    // "Nothing right now" and "nothing ever" are different, and a
+    // merge that treated an empty feed as a close would finish early
+    // on a slow reader.
+    let m = lsmmerge.merge(1, 99, false)
+
+    test.case("an empty feed leaves the merge going")
+    match lsmmerge.feed(m, 0, [])
+        Err(_)  => test.assert(false)
+        Ok(fed) => test.assert(lsmmerge.is_done(fed) == false)
+
+    test.case("a close finishes it")
+    match lsmmerge.close(m, 0)
+        Err(_)     => test.assert(false)
+        Ok(closed) =>
+            test.assert(lsmmerge.is_done(closed))
+            match lsmmerge.step(closed).what
+                LsmMergeDone => test.assert(true)
+                _            => test.assert(false)
+
+@test
+fn test_an_entry_hidden_by_a_range_tombstone_is_not_visible() [io]
+    // A key hidden by a range delete has no tombstone of its own
+    // anywhere, so nothing in the point-lookup path mentions it.
+    let value = lsmmem.put([0x62], [0x01], 1)
+    let covered = [lsmmem.range_tombstone([0x61], [0x63], 5)]
+
+    test.case("a value under a newer range tombstone is invisible")
+    test.assert(lsmmerge.is_visible(value, covered) == false)
+
+    test.case("a value NEWER than the range tombstone is visible")
+    test.assert(lsmmerge.is_visible(lsmmem.put([0x62], [0x01], 9), covered))
+
+    test.case("a value outside the range is visible")
+    test.assert(lsmmerge.is_visible(lsmmem.put([0x70], [0x01], 1), covered))
+
+    test.case("and with no range tombstones everything ordinary is visible")
+    test.assert(lsmmerge.is_visible(value, []))
+
+    test.case("a tombstone is never what a reader is handed")
+    test.assert(lsmmerge.is_visible(lsmmem.tombstone([0x62], 9), []) == false)
+
+@test
+fn test_range_tombstones_are_collected_before_visibility_is_decided() [io]
+    let mixed = [lsmmem.put([0x61], [], 1),
+                 lsmmem.range_tombstone([0x62], [0x64], 5),
+                 lsmmem.tombstone([0x65], 6)]
+
+    test.case("only the range ones come back")
+    test.assert(list.len(lsmmerge.range_tombstones_of(mixed)) == 1)
+
+    test.case("and a list with none answers none")
+    test.assert(list.len(lsmmerge.range_tombstones_of([])) == 0)
+
+@test
+fn test_the_merge_counts_what_it_emitted_and_what_it_dropped() [io]
+    // The number a compaction reports as what it reclaimed, and the
+    // one that says whether a level's tombstone pressure was worth
+    // compacting for.
+    let m = lsmmerge.merge(1, 99, false)
+
+    test.case("a fresh merge has emitted and dropped nothing")
+    test.assert(lsmmerge.emitted(m) == 0)
+    test.assert(lsmmerge.dropped(m) == 0)
+
+@test
+fn test_an_empty_merge_is_done_immediately_and_emits_nothing() [io]
+    test.case("no sources, nothing to say")
+    test.assert(list.len(lsmmerge.merge_all([], 99, false)) == 0)
+
+    test.case("and a point read over no sources is a miss")
+    match lsmmerge.newest_of([], [0x61], 99)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_keys_come_out_in_order_across_every_source() [io]
+    let a = [lsmmem.put([0x61], [], 1), lsmmem.put([0x64], [], 1)]
+    let b = [lsmmem.put([0x62], [], 2), lsmmem.put([0x63], [], 2)]
+
+    let out = lsmmerge.merge_all([b, a], 0, false)
+
+    test.case("four distinct keys, interleaved from two sources")
+    test.assert(list.len(out) == 4)
+
+    test.case("and in ascending key order")
+    match list.nth(out, 0)
+        Some(e) => test.assert(lsmmem.keys_eq(e.key, [0x61]))
+        None    => test.assert(false)
+    match list.nth(out, 3)
+        Some(e) => test.assert(lsmmem.keys_eq(e.key, [0x64]))
+        None    => test.assert(false)

@@ -1,0 +1,455 @@
+// lsmlevel.nv — the manifest of levels, and the planner that answers
+// which tables to merge next.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE PLANNER ANSWERS A PLAN AND PERFORMS NOTHING.  `pick` reads the
+// manifest and returns a `LsmPlan` — these inputs, that output level,
+// this key range — and the store decides whether to run it, when, and
+// on which thread.  That separation is what makes a compaction policy
+// testable: a test builds a manifest, asks for a plan, and asserts on
+// the answer, with no file, no thread and no timing in it.
+//
+// LEVEL 0 IS DIFFERENT AND EVERY LSM SAYS SO.  Its tables OVERLAP,
+// because each one is a memtable flushed whole and two flushes cover
+// the same keys.  So a read that misses the memtable consults EVERY
+// level-0 table, and level 0's trigger is a table COUNT rather than a
+// byte size.  Every deeper level's tables are disjoint, so a read
+// consults at most one per level and the trigger is bytes.  Two
+// different rules, one field apart, and `is_overlapping` is the
+// predicate rather than `level == 0` written in six places.
+//
+// A TOMBSTONE MAY ONLY BE DROPPED AT THE BOTTOM.  The second
+// load-bearing rule of the package, after the ordering.  A compaction
+// that dropped a tombstone at level 2 resurrects the key from the copy
+// at level 3 that the compaction did not read — and the resurrection
+// happens silently, minutes later, to a key somebody deleted. So
+// `plan_may_drop_tombstones` is a function of the plan, it is
+// published, and `lsmmerge` takes its answer as an argument rather
+// than deciding for itself.
+//
+// SNAPSHOTS PIN VERSIONS.  A compaction may drop an older version of a
+// key only when no live snapshot sits between it and the newer one.
+// `LsmPlan.oldest_snapshot` carries that boundary; a store with no
+// readers passes its current sequence and everything older than the
+// newest version goes.
+
+use lsmerror
+use lsmmem
+
+// One table, as the manifest knows it.
+pub struct LsmTableRef
+    // The table's id.  The caller maps it to a file; this package
+    // never sees a path.
+    id: Int
+    // Which level it sits at.
+    level: Int
+    // How many bytes the file is.
+    bytes: Int
+    // The smallest and largest keys it holds.
+    keys: lsmmem.LsmRange
+    // The lowest and highest sequence numbers it holds.
+    min_seq: Int
+    max_seq: Int
+    // How many entries, versions included.
+    entries: Int
+
+// Every table the store has, arranged by level.
+pub struct LsmManifest
+    // The tables, in no particular order; `tables_at` is how a caller
+    // asks for one level's.
+    tables: [LsmTableRef]
+    // How many levels the store uses.  Seven is LevelDB's and
+    // RocksDB's.
+    levels: Int
+    // The next sequence number to assign.
+    next_seq: Int
+    // The next table id to assign.
+    next_id: Int
+
+// A compaction to run.
+pub struct LsmPlan
+    // Why this compaction was picked.
+    reason: LsmReason
+    // The tables to read, in the order a merge should prefer them —
+    // newest first, which for tables at different levels means the
+    // shallower level first, and within level 0 means the higher id
+    // first.
+    inputs: [Int]
+    // The level the output tables go to.
+    output_level: Int
+    // The keys the output covers.  A store can use it to decide
+    // whether two plans conflict without reading either's tables.
+    keys: lsmmem.LsmRange
+    // The oldest sequence number any live reader can see.  A version
+    // older than this, with a newer version of the same key also in
+    // the inputs, may be dropped.
+    oldest_snapshot: Int
+    // True when the output level is the deepest one the store uses, so
+    // no table below could hold an older copy — the one condition
+    // under which a tombstone may be dropped.
+    at_bottom: Bool
+
+// Why a compaction was picked.
+//
+// Published rather than left implicit because a store's metrics want
+// it, and because "which of my compactions are triggered by level 0"
+// is the question that tells an operator whether their write rate has
+// outrun their flush rate.
+pub enum LsmReason
+    // Level 0 has reached `l0_trigger` tables.  The urgent one: every
+    // level-0 table is consulted on every read that misses.
+    LsmReasonL0Count
+    // A level has outgrown its byte budget.
+    LsmReasonLevelBytes(level: Int)
+    // A table holds enough tombstones that compacting it would free
+    // real space.  The one a store can choose to skip.
+    LsmReasonTombstones(table: Int)
+    // The caller asked for a specific range.
+    LsmReasonManual
+
+// An empty manifest with `levels` levels.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${lsmlevel.manifest(7).levels}")
+// ```
+pub fn manifest(levels: Int) -> LsmManifest []
+    todo("lsm-nv.lsmlevel.manifest")
+
+// A table reference, built.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let r = lsmmem.range([], [])
+//     println("${lsmlevel.table_ref(1, 0, 4096, r, 1, 9, 100).id}")
+// ```
+pub fn table_ref(id: Int, level: Int, bytes: Int, keys: lsmmem.LsmRange, min_seq: Int, max_seq: Int,
+                 entries: Int) -> LsmTableRef []
+    todo("lsm-nv.lsmlevel.table_ref")
+
+// `m` with `t` added.
+//
+// `LsmNoSuchLevel` when `t.level` is outside the manifest's.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let t = lsmlevel.table_ref(1, 0, 4096, lsmmem.range([], []), 1, 9, 100)
+//     match lsmlevel.add_table(lsmlevel.manifest(7), t)
+//         Ok(m)  => println("${m.next_id}")
+//         Err(_) => println("no such level")
+// ```
+pub fn add_table(m: LsmManifest, t: LsmTableRef) -> Result<LsmManifest, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmlevel.add_table")
+
+// `m` with table `id` removed.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     match lsmlevel.remove_table(lsmlevel.manifest(7), 1)
+//         Ok(m)  => println("${m.levels}")
+//         Err(_) => println("no such table")
+// ```
+pub fn remove_table(m: LsmManifest, id: Int) -> Result<LsmManifest, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmlevel.remove_table")
+
+// `m` with a plan's inputs removed and its outputs added, in one step.
+//
+// One call rather than a loop of removes and adds because a manifest
+// that has the inputs gone and the outputs not yet in is a manifest in
+// which those keys do not exist — and a reader that saw it would
+// answer a miss for a key that was never deleted.  A store persists
+// the result of this call, not the steps.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     let m = lsmlevel.manifest(7)
+//     match lsmlevel.apply(m, lsmlevel.pick(m, lsmmem.default_options()), [])
+//         Ok(next) => println("${next.levels}")
+//         Err(_)   => println("no")
+// ```
+pub fn apply(m: LsmManifest, p: LsmPlan,
+             outputs: [LsmTableRef]) -> Result<LsmManifest, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmlevel.apply")
+
+// The tables at `level`, in order: by smallest key for a level whose
+// tables are disjoint, and NEWEST FIRST — highest id first — for level
+// 0, whose tables overlap and where the newest wins.
+//
+// The two orders are the two rules the module comment names, and a
+// caller that got level 0's order wrong would answer a stale value
+// with nothing to show for it.
+//
+// ```novo
+// use std.list
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${list.len(lsmlevel.tables_at(lsmlevel.manifest(7), 0))}")
+// ```
+pub fn tables_at(m: LsmManifest, level: Int) -> [LsmTableRef] []
+    todo("lsm-nv.lsmlevel.tables_at")
+
+// True when `level`'s tables may overlap each other — true only for
+// level 0.
+//
+// The predicate rather than `level == 0` written in six places.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${lsmlevel.is_overlapping(0)}")
+// ```
+pub fn is_overlapping(level: Int) -> Bool []
+    todo("lsm-nv.lsmlevel.is_overlapping")
+
+// Every table at `level` whose range holds `key`.
+//
+// A list rather than an option because level 0's tables overlap: a
+// key can be in four of them at once, and a reader has to consult all
+// four, newest first, and stop at the first entry — which may be a
+// tombstone.
+//
+// ```novo
+// use std.list
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${list.len(lsmlevel.tables_holding(lsmlevel.manifest(7), 0, []))}")
+// ```
+pub fn tables_holding(m: LsmManifest, level: Int, key: [u8]) -> [LsmTableRef] []
+    todo("lsm-nv.lsmlevel.tables_holding")
+
+// Every table in the whole store that could hold `key`, in the order a
+// read must consult them: level 0 newest first, then one per deeper
+// level.
+//
+// The read path's plan, answered in one call — because assembling it
+// by hand is where a reader forgets that level 0 is different.
+//
+// ```novo
+// use std.list
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${list.len(lsmlevel.read_path(lsmlevel.manifest(7), []))}")
+// ```
+pub fn read_path(m: LsmManifest, key: [u8]) -> [LsmTableRef] []
+    todo("lsm-nv.lsmlevel.read_path")
+
+// How many bytes `level` holds.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${lsmlevel.level_bytes(lsmlevel.manifest(7), 1)}")
+// ```
+pub fn level_bytes(m: LsmManifest, level: Int) -> Int []
+    todo("lsm-nv.lsmlevel.level_bytes")
+
+// How many bytes `level` is allowed: `o.base_level_bytes` times
+// `o.level_multiplier` to the power of `level - 1`, and `0` for level
+// 0, which is counted in tables.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmlevel.level_budget(1, lsmmem.default_options())}")
+// ```
+pub fn level_budget(level: Int, o: lsmmem.LsmOptions) -> Int []
+    todo("lsm-nv.lsmlevel.level_budget")
+
+// How far past its budget `level` is, as a ratio times 1000 — so 1500
+// means half again over.  Zero for a level within budget.
+//
+// An integer rather than a float because it is a priority key and
+// nothing here needs a float; `pick` compares these across levels and
+// takes the largest.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let m = lsmlevel.manifest(7)
+//     println("${lsmlevel.level_pressure(m, 1, lsmmem.default_options())}")
+// ```
+pub fn level_pressure(m: LsmManifest, level: Int, o: lsmmem.LsmOptions) -> Int []
+    todo("lsm-nv.lsmlevel.level_pressure")
+
+// ── the planner ──────────────────────────────────────────────────────
+
+// The compaction to run next, or a plan with no inputs when there is
+// none.
+//
+// Level 0's table count first, because every level-0 table is read on
+// every miss and letting them pile up degrades reads immediately; then
+// the level under the most byte pressure.
+//
+// ```novo
+// use std.list
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println("${list.len(p.inputs)}")
+// ```
+pub fn pick(m: LsmManifest, o: lsmmem.LsmOptions) -> LsmPlan []
+    todo("lsm-nv.lsmlevel.pick")
+
+// The plan `pick` would give, with a snapshot boundary set.
+//
+// The variant a store with live readers calls: a version older than
+// `oldest_snapshot` with a newer version in the inputs may be dropped,
+// and one that a reader can still see may not.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let m = lsmlevel.manifest(7)
+//     println("${lsmlevel.pick_with(m, lsmmem.default_options(), 100).oldest_snapshot}")
+// ```
+pub fn pick_with(m: LsmManifest, o: lsmmem.LsmOptions, oldest_snapshot: Int) -> LsmPlan []
+    todo("lsm-nv.lsmlevel.pick_with")
+
+// A plan compacting exactly the range `[from, to)` at `level` down to
+// `level + 1`.
+//
+// What a caller asking for a manual compaction gets — a range delete
+// followed by "and reclaim that space now", or a repair tool.
+//
+// ```novo
+// use std.list
+// use lsmlevel
+//
+// fn main() [io]
+//     let p = lsmlevel.plan_range(lsmlevel.manifest(7), 0, [], [], 100)
+//     println("${list.len(p.inputs)}")
+// ```
+pub fn plan_range(m: LsmManifest, level: Int, from: [u8], to: [u8],
+                  oldest_snapshot: Int) -> LsmPlan []
+    todo("lsm-nv.lsmlevel.plan_range")
+
+// True when the plan has work to do.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println("${lsmlevel.plan_is_empty(p)}")
+// ```
+pub fn plan_is_empty(p: LsmPlan) -> Bool []
+    todo("lsm-nv.lsmlevel.plan_is_empty")
+
+// True when a merge running this plan may drop tombstones.
+//
+// The second load-bearing rule of the package: a tombstone dropped
+// anywhere but the bottom level resurrects the key from the copy below
+// that the compaction did not read, silently, minutes later.  It is a
+// function of the plan and it is published so `lsmmerge` takes the
+// answer as an argument rather than deciding for itself.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println("${lsmlevel.plan_may_drop_tombstones(p)}")
+// ```
+pub fn plan_may_drop_tombstones(p: LsmPlan) -> Bool []
+    todo("lsm-nv.lsmlevel.plan_may_drop_tombstones")
+
+// True when the two plans touch overlapping keys at overlapping
+// levels, so a store must not run them at once.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println("${lsmlevel.plans_conflict(p, p)}")
+// ```
+pub fn plans_conflict(a: LsmPlan, b: LsmPlan) -> Bool []
+    todo("lsm-nv.lsmlevel.plans_conflict")
+
+// How many bytes the plan reads and writes between them — the write
+// amplification of running it.
+//
+// What a store's scheduler budgets against, and what an operator
+// deciding whether a level multiplier of ten is right for their
+// workload measures.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let m = lsmlevel.manifest(7)
+//     println("${lsmlevel.plan_bytes(m, lsmlevel.pick(m, lsmmem.default_options()))}")
+// ```
+pub fn plan_bytes(m: LsmManifest, p: LsmPlan) -> Int []
+    todo("lsm-nv.lsmlevel.plan_bytes")
+
+// A one-line description of why the plan was picked, for a log.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println(lsmlevel.reason_text(p.reason))
+// ```
+pub fn reason_text(r: LsmReason) -> Str []
+    todo("lsm-nv.lsmlevel.reason_text")
+
+// How many tables a read that misses the memtable must consult, worst
+// case.
+//
+// The number that says whether the store is healthy: it is level 0's
+// table count plus one per deeper non-empty level, and it grows the
+// moment compaction falls behind.  A store's health check is this
+// number against a threshold.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${lsmlevel.read_amplification(lsmlevel.manifest(7))}")
+// ```
+pub fn read_amplification(m: LsmManifest) -> Int []
+    todo("lsm-nv.lsmlevel.read_amplification")
+
+// How many bytes the store holds across every level.
+//
+// ```novo
+// use lsmlevel
+//
+// fn main() [io]
+//     println("${lsmlevel.total_bytes(lsmlevel.manifest(7))}")
+// ```
+pub fn total_bytes(m: LsmManifest) -> Int []
+    todo("lsm-nv.lsmlevel.total_bytes")

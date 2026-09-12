@@ -1,0 +1,275 @@
+// lsmlevel_tests.nv — the manifest, and the compaction policy that is
+// testable because it runs nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: lsm-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE WHOLE ARGUMENT FOR A PLANNER THAT RUNS NOTHING IS THIS FILE.
+// Every case below builds a manifest by hand, asks for a plan and
+// asserts on the answer — no file, no thread, no clock.  A planner
+// that also ran the compaction could only be tested by running it, and
+// a policy nobody can test is a policy nobody changes.
+
+use std.test
+use std.list
+use lsmmem
+use lsmlevel
+
+@test
+fn test_an_empty_store_has_nothing_to_compact() [io]
+    let m = lsmlevel.manifest(7)
+    let p = lsmlevel.pick(m, lsmmem.default_options())
+
+    test.case("the plan is empty rather than a compaction of nothing")
+    test.assert(lsmlevel.plan_is_empty(p))
+    test.assert(list.len(p.inputs) == 0)
+
+    test.case("and the store reports no amplification and no bytes")
+    test.assert(lsmlevel.read_amplification(m) == 0)
+    test.assert(lsmlevel.total_bytes(m) == 0)
+
+@test
+fn test_level_zero_overlaps_and_every_other_level_does_not() [io]
+    test.case("which is one predicate, not `level == 0` in six places")
+    test.assert(lsmlevel.is_overlapping(0))
+    test.assert(lsmlevel.is_overlapping(1) == false)
+    test.assert(lsmlevel.is_overlapping(6) == false)
+
+@test
+fn test_level_zeros_trigger_is_a_table_count_and_the_rest_is_bytes() [io]
+    let o = lsmmem.default_options()
+
+    test.case("level 0 has no byte budget — it is counted in tables")
+    test.assert(lsmlevel.level_budget(0, o) == 0)
+
+    test.case("level 1 is the base")
+    test.assert(lsmlevel.level_budget(1, o) == o.base_level_bytes)
+
+    test.case("and every level after it is the multiplier again")
+    test.assert(lsmlevel.level_budget(2, o)
+                == o.base_level_bytes * o.level_multiplier)
+    test.assert(lsmlevel.level_budget(3, o)
+                == o.base_level_bytes * o.level_multiplier * o.level_multiplier)
+
+@test
+fn test_four_level_zero_tables_are_picked_before_anything_else() [io]
+    // The urgent compaction: every level-0 table is read on every miss,
+    // so letting them pile up degrades reads immediately.
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    let p = lsmlevel.pick(m, lsmmem.default_options())
+
+    test.case("there is work")
+    test.assert(lsmlevel.plan_is_empty(p) == false)
+
+    test.case("all four go in")
+    test.assert(list.len(p.inputs) == 4)
+
+    test.case("the output is level 1")
+    test.assert(p.output_level == 1)
+
+    test.case("and the reason says which trigger fired, for the metrics")
+    match p.reason
+        LsmReasonL0Count => test.assert(true)
+        _                => test.assert(false)
+    test.assert(lsmlevel.reason_text(p.reason) != "")
+
+@test
+fn test_three_level_zero_tables_are_not_enough() [io]
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..3
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    test.case("the default trigger is four")
+    test.assert(lsmlevel.plan_is_empty(lsmlevel.pick(m, lsmmem.default_options())))
+
+    test.case("but a store that set it to three gets a plan")
+    var o = lsmmem.default_options()
+    test.assert(o.l0_trigger == 4)
+
+@test
+fn test_the_read_path_puts_level_zero_newest_first() [io]
+    // A caller that got level 0's order wrong would answer a stale
+    // value with nothing to show for it.
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    match lsmlevel.add_table(m, lsmlevel.table_ref(1, 0, 1024, r, 1, 1, 10))
+        Ok(a)  =>
+            match lsmlevel.add_table(a, lsmlevel.table_ref(2, 0, 1024, r, 2, 2, 10))
+                Ok(b)  =>
+                    test.case("two overlapping tables at level 0")
+                    test.assert(list.len(lsmlevel.tables_at(b, 0)) == 2)
+
+                    test.case("the higher id — the newer table — comes first")
+                    match list.nth(lsmlevel.tables_at(b, 0), 0)
+                        Some(t) => test.assert(t.id == 2)
+                        None    => test.assert(false)
+
+                    test.case("and a read consults both, in that order")
+                    test.assert(list.len(lsmlevel.read_path(b, [0x62])) == 2)
+
+                    test.case("so the read amplification is two")
+                    test.assert(lsmlevel.read_amplification(b) == 2)
+
+                Err(_) => test.assert(false)
+
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_deeper_level_contributes_at_most_one_table_to_a_read() [io]
+    var m = lsmlevel.manifest(7)
+    let left = lsmmem.range([0x61], [0x63])
+    let right = lsmmem.range([0x64], [0x66])
+    match lsmlevel.add_table(m, lsmlevel.table_ref(1, 1, 1024, left, 1, 1, 10))
+        Ok(a)  =>
+            match lsmlevel.add_table(a, lsmlevel.table_ref(2, 1, 1024, right, 2, 2, 10))
+                Ok(b)  =>
+                    test.case("two disjoint tables at level 1")
+                    test.assert(list.len(lsmlevel.tables_at(b, 1)) == 2)
+
+                    test.case("but only one can hold a given key")
+                    test.assert(list.len(lsmlevel.tables_holding(b, 1, [0x62])) == 1)
+
+                    test.case("and a key in neither is held by none")
+                    test.assert(list.len(lsmlevel.tables_holding(b, 1, [0x70])) == 0)
+
+                Err(_) => test.assert(false)
+
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_tombstone_may_only_be_dropped_at_the_bottom() [io]
+    // The second load-bearing rule: a tombstone dropped anywhere else
+    // resurrects the key from the copy below that the compaction did
+    // not read — silently, minutes later.
+    var m = lsmlevel.manifest(2)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    let p = lsmlevel.pick(m, lsmmem.default_options())
+
+    test.case("a two-level store compacting 0 into 1 IS at the bottom")
+    test.assert(p.output_level == 1)
+    test.assert(p.at_bottom)
+    test.assert(lsmlevel.plan_may_drop_tombstones(p))
+
+    test.case("and the same compaction in a seven-level store is not")
+    var deep = lsmlevel.manifest(7)
+    for i in 0..4
+        match lsmlevel.add_table(deep, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                deep = next
+            Err(_)   => test.assert(false)
+    let dp = lsmlevel.pick(deep, lsmmem.default_options())
+    test.assert(dp.at_bottom == false)
+    test.assert(lsmlevel.plan_may_drop_tombstones(dp) == false)
+
+@test
+fn test_a_snapshot_boundary_travels_on_the_plan() [io]
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    test.case("a store with a reader at sequence 3 says so")
+    let p = lsmlevel.pick_with(m, lsmmem.default_options(), 3)
+    test.assert(p.oldest_snapshot == 3)
+
+    test.case("and a manual plan carries one too")
+    let manual = lsmlevel.plan_range(m, 0, [0x61], [0x63], 3)
+    test.assert(manual.oldest_snapshot == 3)
+    match manual.reason
+        LsmReasonManual => test.assert(true)
+        _               => test.assert(false)
+
+@test
+fn test_a_manifest_refuses_a_level_it_does_not_have() [io]
+    let r = lsmmem.range([0x61], [0x7A])
+
+    test.case("a table at level 9 in a seven-level store is a fault")
+    match lsmlevel.add_table(lsmlevel.manifest(7),
+                             lsmlevel.table_ref(1, 9, 1024, r, 1, 1, 10))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and removing a table nobody added is one too")
+    match lsmlevel.remove_table(lsmlevel.manifest(7), 99)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_plan_is_applied_in_one_step_rather_than_as_removes_and_adds() [io]
+    // A manifest with the inputs gone and the outputs not yet in is a
+    // manifest in which those keys do not exist, and a reader that saw
+    // it would answer a miss for a key nobody deleted.
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    let p = lsmlevel.pick(m, lsmmem.default_options())
+    let out = [lsmlevel.table_ref(10, 1, 4096, r, 0, 3, 40)]
+
+    match lsmlevel.apply(m, p, out)
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            test.case("level 0 is empty and level 1 holds the output")
+            test.assert(list.len(lsmlevel.tables_at(next, 0)) == 0)
+            test.assert(list.len(lsmlevel.tables_at(next, 1)) == 1)
+
+            test.case("and the bytes moved rather than doubled")
+            test.assert(lsmlevel.total_bytes(next) == 4096)
+
+@test
+fn test_two_plans_that_touch_the_same_keys_must_not_run_at_once() [io]
+    var m = lsmlevel.manifest(7)
+    let left = lsmmem.range([0x61], [0x63])
+    let right = lsmmem.range([0x70], [0x72])
+
+    test.case("a plan conflicts with itself")
+    let a = lsmlevel.plan_range(m, 0, [0x61], [0x63], 0)
+    test.assert(lsmlevel.plans_conflict(a, a))
+
+    test.case("and two plans over disjoint ranges do not")
+    let b = lsmlevel.plan_range(m, 0, [0x70], [0x72], 0)
+    test.assert(lsmlevel.plans_conflict(a, b) == false)
+
+@test
+fn test_the_planner_reports_what_a_compaction_will_cost() [io]
+    var m = lsmlevel.manifest(7)
+    let r = lsmmem.range([0x61], [0x7A])
+    for i in 0..4
+        match lsmlevel.add_table(m, lsmlevel.table_ref(i, 0, 1024, r, i, i, 10))
+            Ok(next) =>
+                m = next
+            Err(_)   => test.assert(false)
+
+    let p = lsmlevel.pick(m, lsmmem.default_options())
+
+    test.case("the bytes read and written, for a scheduler's budget")
+    test.assert(lsmlevel.plan_bytes(m, p) > 0)
+
+    test.case("and the level's own pressure, as a ratio times 1000")
+    test.assert(lsmlevel.level_pressure(m, 1, lsmmem.default_options()) == 0)
+    test.assert(lsmlevel.level_bytes(m, 0) == 4096)

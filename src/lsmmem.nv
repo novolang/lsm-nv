@@ -1,0 +1,516 @@
+// lsmmem.nv — an entry, the order every other module agrees on, and
+// the memtable as a sorted value.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE ORDER IS THE LOAD-BEARING INTERFACE OF THE WHOLE PACKAGE, and
+// it is one comparator: **by key ASCENDING, then by sequence number
+// DESCENDING.**  `compare_entries` is that rule, it is public, and
+// every other module is written against it — the memtable's insert,
+// the SSTable's block layout, the merge iterator's heap, and the
+// compaction's drop decisions.
+//
+// Why it is worth publishing rather than burying: a key in an LSM is
+// not one value, it is a SEQUENCE of versions spread across the
+// memtable and every level, and the newest one wins.  Every
+// correctness bug an LSM has is a version-ordering bug — a merge that
+// answered the older of two versions, a read that stopped at level 1
+// while level 0 held a newer write, a compaction that dropped a
+// tombstone and resurrected a key deleted a year ago.  Each of those
+// is this comparator applied inconsistently in one place, and the only
+// defence is that there is exactly one of it and it has a name.
+//
+// The descending half is the part people write ascending.  With
+// sequence descending, the first entry for a key IS the current one,
+// so every reader is `find the key, take the first` and no reader
+// scans to the end of a run to find the newest.  Ascending would make
+// every one of them scan, and the one that forgot would answer a stale
+// value with no error anywhere.
+//
+// A TOMBSTONE IS AN ENTRY, NOT AN ABSENCE.  `LsmDelete` carries a key,
+// a sequence number and no value, and it travels through the levels
+// like any other entry until a compaction that reaches the bottom
+// level drops it.  A delete that removed the key instead would be a
+// delete that the next level's older copy undoes.
+//
+// KEYS AND VALUES ARE THE CALLER'S BYTES.  Nothing here interprets
+// them and nothing here copies them more than the structure demands;
+// the ordering is `memcmp`, unsigned, which is what every LSM does and
+// what makes a stored key's order independent of anybody's locale.
+
+use lsmerror
+
+// What an entry does to the key it names.
+pub enum LsmKind
+    // The key has this value from this sequence number on.
+    LsmPut
+    // The key is gone from this sequence number on.  A tombstone, and
+    // an entry like any other — see the module comment.
+    LsmDelete
+    // The key's range is gone from this sequence number on: every key
+    // from this entry's key up to but not including `range_end`.  One
+    // entry rather than one per key, because "delete this prefix" over
+    // a million keys should not write a million tombstones.
+    LsmDeleteRange
+
+// One version of one key.
+pub struct LsmEntry
+    // The key, as the caller's bytes.  Compared unsigned, byte by
+    // byte, shorter-is-less on a prefix.
+    key: [u8]
+    // The value, empty for a tombstone.
+    value: [u8]
+    // When this version happened.  Monotonic across the whole store
+    // and never reused; the store assigns them and this package only
+    // compares them.
+    seq: Int
+    // What it does.
+    kind: LsmKind
+    // For `LsmDeleteRange`, the exclusive end of the range; empty
+    // otherwise.  An empty end on a range delete means "to the end of
+    // the keyspace".
+    range_end: [u8]
+
+// A memtable: the writes that have not been flushed to a table yet.
+//
+// Sorted by `compare_entries`, so a flush is a walk and not a sort,
+// which is what keeps a flush off the write path's critical section.
+pub struct LsmMemtable
+    // The entries, in order.
+    entries: [LsmEntry]
+    // How many bytes of key and value the table holds.  Tracked rather
+    // than computed because `should_flush` is asked on every write and
+    // a walk per write is quadratic.
+    bytes: Int
+    // The highest sequence number in the table.
+    max_seq: Int
+    // The lowest.  A recovery that replays a WAL needs both ends to
+    // know which records it has already.
+    min_seq: Int
+    // True once the table has been handed to a flush.  A frozen table
+    // refuses writes, because a flush that saw entries appear under it
+    // would write a table whose contents do not match its own footer.
+    frozen: Bool
+
+// What a store is allowed to hold and how big the pieces are.
+pub struct LsmOptions
+    // Flush the memtable once it holds this many bytes of key and
+    // value.  The single most consequential number in an LSM: larger
+    // means fewer, bigger tables and more memory at risk in a crash.
+    memtable_bytes: Int
+    // Target size of a data block inside an SSTable, in bytes.  A
+    // block is the unit a reader fetches, so this is the read
+    // amplification of a point lookup.
+    block_bytes: Int
+    // How many keys share one entry in a data block's restart array —
+    // the interval at which prefix compression is reset so a binary
+    // search has somewhere to land.
+    restart_interval: Int
+    // Bits of bloom filter per key, or `0` for no filter.  Ten is
+    // about a one per cent false positive rate.
+    bloom_bits_per_key: Int
+    // Refuse a key longer than this.
+    max_key_len: Int
+    // Refuse a value longer than this.
+    max_value_len: Int
+    // How many tables level 0 may hold before a compaction is due.
+    // Level 0's tables OVERLAP, so every one of them has to be
+    // consulted on every read that misses the memtable; this number is
+    // the read amplification of a miss.
+    l0_trigger: Int
+    // The size ratio between one level and the next.  Ten is
+    // LevelDB's and RocksDB's.
+    level_multiplier: Int
+    // Target byte size of level 1.  Every deeper level is this times
+    // `level_multiplier` to the power of its depth.
+    base_level_bytes: Int
+
+// LevelDB's defaults, which are also RocksDB's where the two agree: a
+// 4 MB memtable, 4 KB blocks, a restart every 16 keys, 10 bloom bits
+// per key, 4 tables at level 0, a multiplier of 10 and a 64 MB level 1.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.default_options().block_bytes}")
+// ```
+pub fn default_options() -> LsmOptions []
+    todo("lsm-nv.lsmmem.default_options")
+
+// ── the order ────────────────────────────────────────────────────────
+
+// `a` and `b` as `-1`, `0`, `1`: **by key ascending, then by sequence
+// DESCENDING.**
+//
+// The one comparator this package has.  See the module comment for why
+// the sequence half is descending and why a reader that got it
+// ascending would answer stale values with nothing to show for it.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     let e = lsmmem.put([], [], 1)
+//     println("${lsmmem.compare_entries(e, e)}")
+// ```
+pub fn compare_entries(a: LsmEntry, b: LsmEntry) -> Int []
+    todo("lsm-nv.lsmmem.compare_entries")
+
+// `a` and `b` as `-1`, `0`, `1`, comparing bytes unsigned and
+// shorter-is-less on a prefix.
+//
+// Published separately from `compare_entries` because the manifest,
+// the bloom filter and the compaction planner all compare keys without
+// having entries, and because it is the one function whose being
+// `memcmp` rather than anything locale-aware is worth stating.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.compare_keys([], [])}")
+// ```
+pub fn compare_keys(a: [u8], b: [u8]) -> Int []
+    todo("lsm-nv.lsmmem.compare_keys")
+
+// True when `a` and `b` are the same bytes.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.keys_eq([], [])}")
+// ```
+pub fn keys_eq(a: [u8], b: [u8]) -> Bool []
+    todo("lsm-nv.lsmmem.keys_eq")
+
+// The shortest key that sorts after every key with prefix `p` — `p`
+// with its last non-`0xFF` byte incremented and everything after it
+// dropped, or empty when `p` is all `0xFF`.
+//
+// What a prefix scan's exclusive upper bound is, and what a range
+// delete over a prefix writes as its `range_end`.  Empty means "to the
+// end of the keyspace", which is the right answer for an all-`0xFF`
+// prefix and is why this cannot simply append a `0xFF`.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     println("${list.len(lsmmem.prefix_end([]))}")
+// ```
+pub fn prefix_end(p: [u8]) -> [u8] []
+    todo("lsm-nv.lsmmem.prefix_end")
+
+// The shortest key that is `>= a` and `< b`, for an index entry.
+//
+// The trick that makes an SSTable's index small: the separator between
+// two blocks does not have to be a key that exists, only one that
+// sorts between them, so `"application"` and `"apply"` separate at
+// `"appli"` and the index stores five bytes instead of eleven.  Empty
+// when no such key exists, which happens when `a` is a prefix of `b`.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     println("${list.len(lsmmem.separator([], []))}")
+// ```
+pub fn separator(a: [u8], b: [u8]) -> [u8] []
+    todo("lsm-nv.lsmmem.separator")
+
+// ── entries ──────────────────────────────────────────────────────────
+
+// A put.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.put([], [], 7).seq}")
+// ```
+pub fn put(key: [u8], value: [u8], seq: Int) -> LsmEntry []
+    todo("lsm-nv.lsmmem.put")
+
+// A tombstone.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.tombstone([], 7).seq}")
+// ```
+pub fn tombstone(key: [u8], seq: Int) -> LsmEntry []
+    todo("lsm-nv.lsmmem.tombstone")
+
+// A range tombstone covering `[from, to)`.
+//
+// An empty `to` covers everything from `from` to the end of the
+// keyspace.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.range_tombstone([], [], 7).seq}")
+// ```
+pub fn range_tombstone(from: [u8], to: [u8], seq: Int) -> LsmEntry []
+    todo("lsm-nv.lsmmem.range_tombstone")
+
+// True when `e` removes rather than sets.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.is_tombstone(lsmmem.tombstone([], 1))}")
+// ```
+pub fn is_tombstone(e: LsmEntry) -> Bool []
+    todo("lsm-nv.lsmmem.is_tombstone")
+
+// True when `e` is a range tombstone covering `key`.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.range_covers(lsmmem.range_tombstone([], [], 1), [])}")
+// ```
+pub fn range_covers(e: LsmEntry, key: [u8]) -> Bool []
+    todo("lsm-nv.lsmmem.range_covers")
+
+// How many bytes `e` occupies in a memtable's accounting: its key, its
+// value, its range end, and the fixed overhead of a sequence number
+// and a kind.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.entry_bytes(lsmmem.put([], [], 1))}")
+// ```
+pub fn entry_bytes(e: LsmEntry) -> Int []
+    todo("lsm-nv.lsmmem.entry_bytes")
+
+// ── the memtable ─────────────────────────────────────────────────────
+
+// An empty memtable.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.memtable().bytes}")
+// ```
+pub fn memtable() -> LsmMemtable []
+    todo("lsm-nv.lsmmem.memtable")
+
+// `m` with `e` inserted in order.
+//
+// An entry with a key and sequence already present REPLACES it, which
+// can only happen on a WAL replay of a record already flushed; every
+// other write has a fresh sequence number.  A frozen memtable answers
+// `LsmMemtableFrozen`.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     match lsmmem.insert(lsmmem.memtable(), lsmmem.put([], [], 1))
+//         Ok(m)  => println("${m.bytes}")
+//         Err(_) => println("frozen")
+// ```
+pub fn insert(m: LsmMemtable, e: LsmEntry) -> Result<LsmMemtable, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmmem.insert")
+
+// `m` with every entry in `es` inserted, in one pass.
+//
+// What a WAL replay and a batch write use: inserting one at a time
+// into a sorted list is quadratic, and a batch that is already sorted
+// merges in linear time.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     match lsmmem.insert_batch(lsmmem.memtable(), [])
+//         Ok(m)  => println("${m.bytes}")
+//         Err(_) => println("frozen")
+// ```
+pub fn insert_batch(m: LsmMemtable, es: [LsmEntry]) -> Result<LsmMemtable, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmmem.insert_batch")
+
+// The newest entry for `key` at or before `at_seq`, or `None`.
+//
+// `at_seq` is what makes a snapshot read a snapshot: a reader holding
+// a sequence number sees the store as it was, and a write that landed
+// afterwards is invisible to it.  Pass the store's current sequence
+// for an ordinary read.
+//
+// The answer is the ENTRY, tombstone included — a caller that treated
+// `None` and a tombstone the same would stop the read at the memtable
+// and never consult the levels, which is right for a tombstone and
+// wrong for a miss.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     match lsmmem.get(lsmmem.memtable(), [], 99)
+//         Some(_) => println("found")
+//         None    => println("not here")
+// ```
+pub fn get(m: LsmMemtable, key: [u8], at_seq: Int) -> ?LsmEntry []
+    todo("lsm-nv.lsmmem.get")
+
+// Every entry in `[from, to)` at or before `at_seq`, newest version of
+// each key first, in key order.
+//
+// An empty `to` scans to the end.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     println("${list.len(lsmmem.scan(lsmmem.memtable(), [], [], 99))}")
+// ```
+pub fn scan(m: LsmMemtable, from: [u8], to: [u8], at_seq: Int) -> [LsmEntry] []
+    todo("lsm-nv.lsmmem.scan")
+
+// True when `m` has reached `o.memtable_bytes`.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.should_flush(lsmmem.memtable(), lsmmem.default_options())}")
+// ```
+pub fn should_flush(m: LsmMemtable, o: LsmOptions) -> Bool []
+    todo("lsm-nv.lsmmem.should_flush")
+
+// `m` frozen: no further writes, contents fixed for a flush.
+//
+// The moment a store swaps in a fresh memtable and hands this one to
+// whatever writes tables.  Freezing rather than copying is what keeps
+// the swap O(1) on the write path.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.freeze(lsmmem.memtable()).frozen}")
+// ```
+pub fn freeze(m: LsmMemtable) -> LsmMemtable []
+    todo("lsm-nv.lsmmem.freeze")
+
+// Every entry in `m`, in `compare_entries` order.
+//
+// What a flush writes.  The list is the memtable's own, already
+// sorted, so this is not a sort.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     println("${list.len(lsmmem.entries(lsmmem.memtable()))}")
+// ```
+pub fn entries(m: LsmMemtable) -> [LsmEntry] []
+    todo("lsm-nv.lsmmem.entries")
+
+// How many entries `m` holds, versions included.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.count(lsmmem.memtable())}")
+// ```
+pub fn count(m: LsmMemtable) -> Int []
+    todo("lsm-nv.lsmmem.count")
+
+// The smallest and largest keys in `m`, or two empty keys when it is
+// empty.
+//
+// What the table written from this memtable records as its range, and
+// what the manifest indexes on.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     let r = lsmmem.key_range(lsmmem.memtable())
+//     println("${list.len(r.smallest)}")
+// ```
+pub fn key_range(m: LsmMemtable) -> LsmRange []
+    todo("lsm-nv.lsmmem.key_range")
+
+// A span of the keyspace, both ends included.
+//
+// Inclusive at both ends because that is what a table's own range is —
+// the smallest and largest keys it actually contains — and mixing that
+// with the half-open ranges scans use is the sort of thing that is
+// wrong by one key at the boundary and passes every test that does not
+// probe the boundary.  A half-open scan range is two `[u8]`s and is
+// never one of these.
+pub struct LsmRange
+    // The smallest key, included.
+    smallest: [u8]
+    // The largest key, included.
+    largest: [u8]
+
+// A range, built.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     println("${list.len(lsmmem.range([], []).smallest)}")
+// ```
+pub fn range(smallest: [u8], largest: [u8]) -> LsmRange []
+    todo("lsm-nv.lsmmem.range")
+
+// True when the two ranges share a key.
+//
+// The question level 0 forces on every read and the one a compaction
+// planner asks of every table in the level below.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     let r = lsmmem.range([], [])
+//     println("${lsmmem.ranges_overlap(r, r)}")
+// ```
+pub fn ranges_overlap(a: LsmRange, b: LsmRange) -> Bool []
+    todo("lsm-nv.lsmmem.ranges_overlap")
+
+// The smallest range containing both.
+//
+// ```novo
+// use std.list
+// use lsmmem
+//
+// fn main() [io]
+//     let r = lsmmem.range([], [])
+//     println("${list.len(lsmmem.ranges_union(r, r).smallest)}")
+// ```
+pub fn ranges_union(a: LsmRange, b: LsmRange) -> LsmRange []
+    todo("lsm-nv.lsmmem.ranges_union")
+
+// True when `r` contains `key`.
+//
+// ```novo
+// use lsmmem
+//
+// fn main() [io]
+//     println("${lsmmem.range_holds(lsmmem.range([], []), [])}")
+// ```
+pub fn range_holds(r: LsmRange, key: [u8]) -> Bool []
+    todo("lsm-nv.lsmmem.range_holds")

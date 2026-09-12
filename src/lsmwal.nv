@@ -1,0 +1,399 @@
+// lsmwal.nv — the write-ahead log's record format, and the recovery
+// that stops in the right place.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE SHAPE IS pager-nv's, THE DEPENDENCY IS NOT.  pager-nv is `host`
+// and this package is `core`, so the two cannot be related by a
+// dependency; what they share is a design, and it is worth naming
+// because the three decisions in it are the ones that make crash
+// recovery correct and are each individually easy to get wrong:
+//
+//   A GENERATION, NOT A TRUNCATION.  The header carries two salts and
+//   every record repeats them.  A checkpoint bumps the salts rather
+//   than truncating the file, so recovery stops at the first record
+//   whose generation is stale and there is no window in which the log
+//   has been emptied but the tables are not yet durable.
+//
+//   A CUMULATIVE CHECKSUM.  Each record's checksum folds in the one
+//   before it, so a record lifted out of another log and dropped in is
+//   detected.  A per-record checksum would accept it.
+//
+//   THE COMMIT MARKER IS IN THE RECORD, NOT BESIDE IT.  A record with
+//   `commit` set is the last of its batch and everything up to it is
+//   durable.  A separate commit record would leave a state in which
+//   the batch is written and the marker is not, which is the same
+//   state as a torn tail and has to be treated the same way — so the
+//   separate record buys nothing and costs a write.
+//
+// WHERE IT DIFFERS: pager-nv logs PAGES and this logs ENTRIES, so a
+// record carries a key and a value rather than a page image; and the
+// checksum is crc-nv's CRC-32C rather than SQLite's rolling pair,
+// because `lsmsst` already checksums with crc-nv and one checksum in a
+// package is better than two.
+//
+// A TORN TAIL IS NOT AN ERROR.  The ordinary way a crash ends a log is
+// half a record, and `lsmerror.ends_recovery` answers true for that so
+// a recovery that treated it as corruption — and discarded every
+// committed write in the log — cannot be written by accident.
+
+use crc
+use lsmerror
+use lsmmem
+
+// The log's header, written once at the front.
+pub struct LsmWalHeader
+    // The format version.
+    version: Int
+    // How many checkpoints this log has been through.  Recovery reads
+    // it only to report it.
+    checkpoint_seq: Int
+    // The generation's two halves.  Every record repeats them; a
+    // record that does not match is from before the last checkpoint.
+    salt1: Int
+    salt2: Int
+    // The lowest sequence number this generation may contain.
+    // Everything below it is already in a table.
+    first_seq: Int
+
+// One record's header, ahead of its key and value.
+pub struct LsmWalRecord
+    // The sequence number of the entry.
+    seq: Int
+    // What it does.
+    kind: lsmmem.LsmKind
+    // How long the key is.
+    key_len: Int
+    // How long the value is.
+    value_len: Int
+    // The generation, repeated.
+    salt1: Int
+    salt2: Int
+    // True on the last record of a batch.  Everything up to and
+    // including it is durable once the write returns; a batch whose
+    // last record is missing is discarded whole.
+    commit: Bool
+    // The running checksum through the end of this record.
+    checksum: Int
+
+// A recovery part-way through a log.
+pub struct LsmRecovery
+    // The header it started from.
+    header: LsmWalHeader
+    // Entries recovered so far, in log order — which is sequence
+    // order, because a log is append-only.
+    entries: [lsmmem.LsmEntry]
+    // The byte offset of the end of the last COMMITTED batch.  What a
+    // store truncates to, and what it is safe to have lost after.
+    committed_at: Int
+    // The highest sequence number in a committed batch.
+    committed_seq: Int
+    // Why the walk stopped, or `None` while it is still going.
+    stopped: ?lsmerror.LsmFaultKind
+
+// The size of the log header, in bytes.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.header_size()}")
+// ```
+pub fn header_size() -> Int []
+    todo("lsm-nv.lsmwal.header_size")
+
+// The size of a record header, in bytes — the fixed part, before the
+// key and value.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.record_header_size()}")
+// ```
+pub fn record_header_size() -> Int []
+    todo("lsm-nv.lsmwal.record_header_size")
+
+// A fresh header for a new generation.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.new_header(1, 2, 3, 100).first_seq}")
+// ```
+pub fn new_header(checkpoint_seq: Int, salt1: Int, salt2: Int, first_seq: Int) -> LsmWalHeader []
+    todo("lsm-nv.lsmwal.new_header")
+
+// The header a checkpoint produces from the one before it: the
+// checkpoint count up by one, the salts advanced, and `first_seq` set
+// to the sequence after everything now in a table.
+//
+// Published as its own call because "advance the salts" is the step
+// that makes every record before it stale, and a checkpoint that
+// reused a salt would make recovery replay writes that are already in
+// a table — which is harmless for a put and is NOT harmless for a
+// tombstone whose key has since been written again.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${lsmwal.checkpoint(h, 200).checkpoint_seq}")
+// ```
+pub fn checkpoint(h: LsmWalHeader, first_seq: Int) -> LsmWalHeader []
+    todo("lsm-nv.lsmwal.checkpoint")
+
+// The header appended to `out`, with its own checksum written in.
+//
+// ```novo
+// use std.list
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${list.len(lsmwal.write_header([], h))}")
+// ```
+pub fn write_header(out: [u8], h: LsmWalHeader) -> [u8] []
+    todo("lsm-nv.lsmwal.write_header")
+
+// The header read back, with its checksum checked.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     match lsmwal.read_header([])
+//         Ok(h)  => println("${h.version}")
+//         Err(_) => println("not a log")
+// ```
+pub fn read_header(bytes: [u8]) -> Result<LsmWalHeader, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmwal.read_header")
+
+// One entry appended to `out` as a record, given the running checksum
+// before it.
+//
+// `commit` marks the last record of a batch.  The running checksum is
+// an argument rather than state because the writer is a fold and the
+// caller owns the buffer — which is also what lets a caller build a
+// batch, check its total length against what is left in the log's
+// segment, and only then write it.
+//
+// ```novo
+// use std.list
+// use lsmmem
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     match lsmwal.write_record([], h, lsmmem.put([], [], 1), true, 0)
+//         Ok(w)  => println("${list.len(w.bytes)}")
+//         Err(_) => println("no")
+// ```
+pub fn write_record(out: [u8], h: LsmWalHeader, e: lsmmem.LsmEntry, commit: Bool,
+                    running: Int) -> Result<LsmWalWritten, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmwal.write_record")
+
+// What a record write produced.
+pub struct LsmWalWritten
+    // The buffer, with the record appended.
+    bytes: [u8]
+    // The running checksum after it, to pass to the next write.
+    running: Int
+
+// A whole batch appended to `out`, with only the last record marked
+// `commit`.
+//
+// The call a store makes per transaction, and the reason it exists
+// rather than a loop over `write_record`: marking the wrong record —
+// or every record — as the commit turns a batch that must be applied
+// whole into one that can be applied half, and nothing about the
+// resulting log looks wrong.
+//
+// ```novo
+// use std.list
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     match lsmwal.write_batch([], h, [], 0)
+//         Ok(w)  => println("${list.len(w.bytes)}")
+//         Err(_) => println("no")
+// ```
+pub fn write_batch(out: [u8], h: LsmWalHeader, es: [lsmmem.LsmEntry],
+                   running: Int) -> Result<LsmWalWritten, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmwal.write_batch")
+
+// How many bytes `write_batch` will append, without appending them.
+//
+// What a store checks against the space left in its current segment
+// before it starts writing, so a batch never straddles a rotation.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.batch_len([])}")
+// ```
+pub fn batch_len(es: [lsmmem.LsmEntry]) -> Int []
+    todo("lsm-nv.lsmwal.batch_len")
+
+// ── recovery ─────────────────────────────────────────────────────────
+
+// A recovery starting from a log's header.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${lsmwal.recovery(h).committed_at}")
+// ```
+pub fn recovery(h: LsmWalHeader) -> LsmRecovery []
+    todo("lsm-nv.lsmwal.recovery")
+
+// `r` advanced over as many records as `bytes` holds, starting at
+// `at`.
+//
+// The feed-and-drain door: a store reads the log in chunks and hands
+// each one over, and the recovery keeps the entries it could read and
+// remembers where the last committed batch ended.  A chunk that ends
+// mid-record leaves the recovery asking for that record again; a
+// caller passes the same offset with more bytes.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${lsmwal.replay(lsmwal.recovery(h), 0, []).committed_at}")
+// ```
+pub fn replay(r: LsmRecovery, at: Int, bytes: [u8]) -> LsmRecovery []
+    todo("lsm-nv.lsmwal.replay")
+
+// True when the recovery has stopped — a torn tail, a stale
+// generation, or a fault.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${lsmwal.is_done(lsmwal.recovery(h))}")
+// ```
+pub fn is_done(r: LsmRecovery) -> Bool []
+    todo("lsm-nv.lsmwal.is_done")
+
+// The entries of every COMMITTED batch, in log order.
+//
+// What goes into the memtable.  Entries after the last commit are
+// discarded — they are a transaction the crash interrupted, and a
+// store that kept them would apply half a transaction.
+//
+// ```novo
+// use std.list
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${list.len(lsmwal.committed(lsmwal.recovery(h)))}")
+// ```
+pub fn committed(r: LsmRecovery) -> [lsmmem.LsmEntry] []
+    todo("lsm-nv.lsmwal.committed")
+
+// Why the recovery stopped, or `None` while it is still going.
+//
+// A `LsmWalTorn` or `LsmWalStale` here is the ordinary end of a log
+// and not a problem; anything else is corruption and
+// `lsmerror.is_corruption` is the question.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     match lsmwal.stopped_by(lsmwal.recovery(h))
+//         Some(_) => println("stopped")
+//         None    => println("still going")
+// ```
+pub fn stopped_by(r: LsmRecovery) -> ?lsmerror.LsmFaultKind []
+    todo("lsm-nv.lsmwal.stopped_by")
+
+// The byte offset a store truncates the log to after recovery: the end
+// of the last committed batch.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     println("${lsmwal.truncate_to(lsmwal.recovery(h))}")
+// ```
+pub fn truncate_to(r: LsmRecovery) -> Int []
+    todo("lsm-nv.lsmwal.truncate_to")
+
+// The checksum this log uses: crc-nv's CRC-32C, the same one
+// `lsmsst.block_crc` uses.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.record_crc().width}")
+// ```
+pub fn record_crc() -> crc.Crc []
+    todo("lsm-nv.lsmwal.record_crc")
+
+// The running checksum after folding `bytes` into `running`.
+//
+// Published because the checksum is CUMULATIVE and a caller writing
+// records out of this package's sight — a tool splicing a log, a test
+// building a fixture — has to continue the chain rather than start a
+// new one.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     println("${lsmwal.fold_checksum(0, [])}")
+// ```
+pub fn fold_checksum(running: Int, bytes: [u8]) -> Int []
+    todo("lsm-nv.lsmwal.fold_checksum")
+
+// True when `r`'s salts match the log header's.
+//
+// A record that does not match is from before the last checkpoint,
+// left in the file because the log is written in place and never
+// truncated.  Recovery stops there, and that is the ordinary end of a
+// log rather than a fault.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     match lsmwal.read_record([], h, 0)
+//         Ok(rec) => println("${lsmwal.is_current(rec, h)}")
+//         Err(_)  => println("torn")
+// ```
+pub fn is_current(r: LsmWalRecord, h: LsmWalHeader) -> Bool []
+    todo("lsm-nv.lsmwal.is_current")
+
+// One record read at `at`, with its checksum and generation checked.
+//
+// The single-record door beneath `replay`, for a tool inspecting a log
+// rather than recovering from one.
+//
+// ```novo
+// use lsmwal
+//
+// fn main() [io]
+//     let h = lsmwal.new_header(1, 2, 3, 100)
+//     match lsmwal.read_record([], h, 0)
+//         Ok(rec) => println("${rec.seq}")
+//         Err(_)  => println("torn")
+// ```
+pub fn read_record(bytes: [u8], h: LsmWalHeader,
+                   at: Int) -> Result<LsmWalRecord, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmwal.read_record")

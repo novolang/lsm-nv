@@ -1,0 +1,321 @@
+// lsmmerge.nv — one ordered stream out of several, with the version
+// rules applied exactly once.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE MERGE IS FED, NOT PULLING.  It holds one entry per source and
+// answers `LsmMergeWant(i)` when a source has run dry; the caller
+// hands over the next batch from that source and steps again.  So the
+// same merge drives a compaction reading four SSTables off disk, a
+// scan reading a memtable and two tables, and a test with three lists
+// in memory — because the only thing that differs is who answers the
+// want.
+//
+// A pulling iterator would have needed every source to be a trait with
+// an effect row, and a `core` package cannot call one without leaving
+// its budget (SPEC § 5.6, and `docs/publishing.md` § How a `core`
+// package takes bytes from its host).  Feed and drain is the shape
+// that holds, and it is also the shape that lets a caller read four
+// sources concurrently, which a pulling iterator forces into series.
+//
+// SOURCE ORDER IS PRECEDENCE.  Source 0 is the newest.  Two entries
+// with the same key and the SAME sequence number can only come from
+// the same write replayed into two places — a WAL record already in a
+// table — and the earlier source wins.  Every other tie is broken by
+// `lsmmem.compare_entries`, which is the package's one comparator.
+//
+// THE THREE DECISIONS THE MERGE MAKES, AND WHO DECIDES THEM
+//
+//   which version wins    the merge, by the comparator.
+//   drop an older version the merge, when a newer one exists and no
+//                         snapshot sits between them — `oldest_snapshot`.
+//   drop a tombstone      NOT the merge.  `lsmlevel.plan_may_drop_tombstones`
+//                         decides, and the answer is an argument to
+//                         `merge`, because a tombstone dropped anywhere
+//                         but the bottom level resurrects a key.
+
+use lsmerror
+use lsmlevel
+use lsmmem
+
+// What a merge needs before it can answer.
+pub enum LsmMergeStep
+    // An entry, and the merge has moved past it.
+    LsmMergeEntry(entry: lsmmem.LsmEntry)
+    // Source `i` has run dry; feed it or close it.
+    LsmMergeWant(source: Int)
+    // Every source is closed and drained.
+    LsmMergeDone
+
+// A merge part-way through.
+pub struct LsmMerge
+    // How many sources it is merging.
+    sources: Int
+    // The entries waiting from each source, in order.
+    pending: [[lsmmem.LsmEntry]]
+    // Which sources the caller has closed.
+    closed: [Bool]
+    // The last key emitted, so a later version of it can be dropped.
+    last_key: [u8]
+    // Whether anything has been emitted for `last_key` yet — which is
+    // what makes the FIRST version of a key the surviving one without
+    // an extra comparison per entry.
+    emitted: Bool
+    // The oldest sequence number a live reader can see.
+    oldest_snapshot: Int
+    // Whether tombstones may be dropped.  An argument rather than a
+    // decision; see the module comment.
+    drop_tombstones: Bool
+    // Range tombstones currently in force, in key order.
+    ranges: [lsmmem.LsmEntry]
+
+// A merge over `sources` streams, newest first.
+//
+// `oldest_snapshot` is the sequence below which no reader can see, and
+// `drop_tombstones` comes from `lsmlevel.plan_may_drop_tombstones`.
+// Both are arguments because the merge has no way to know either and a
+// default for either would be wrong in one direction.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.merge(3, 100, false).sources}")
+// ```
+pub fn merge(sources: Int, oldest_snapshot: Int, drop_tombstones: Bool) -> LsmMerge []
+    todo("lsm-nv.lsmmerge.merge")
+
+// A merge built from a plan: as many sources as the plan has inputs,
+// with the plan's snapshot boundary and its tombstone answer.
+//
+// The call a compaction makes, so the two facts travel from the
+// planner to the merge without a caller restating them — which is the
+// step at which `drop_tombstones` gets passed `true` by mistake.
+//
+// ```novo
+// use lsmlevel
+// use lsmmem
+// use lsmmerge
+//
+// fn main() [io]
+//     let p = lsmlevel.pick(lsmlevel.manifest(7), lsmmem.default_options())
+//     println("${lsmmerge.merge_for(p).sources}")
+// ```
+pub fn merge_for(p: lsmlevel.LsmPlan) -> LsmMerge []
+    todo("lsm-nv.lsmmerge.merge_for")
+
+// The next thing the merge has to say.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     match lsmmerge.step(lsmmerge.merge(1, 100, false)).what
+//         LsmMergeWant(i) => println("${i}")
+//         _               => println("something else")
+// ```
+pub fn step(m: LsmMerge) -> LsmMergeStepped []
+    todo("lsm-nv.lsmmerge.step")
+
+// A merge moved on, and what it said.
+pub struct LsmMergeStepped
+    // The merge, moved past whatever it answered.
+    merge: LsmMerge
+    // What it answered.
+    what: LsmMergeStep
+
+// `m` with more entries from source `i`.
+//
+// The entries must be in `lsmmem.compare_entries` order within the
+// batch; the merge does not sort them and will answer them in the
+// order given, which for an out-of-order batch is a wrong answer
+// rather than an error.  Feeding a source that is not the one the
+// merge asked for is allowed — a caller that has bytes for two sources
+// may hand over both — and is why `feed` names the source.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     match lsmmerge.feed(lsmmerge.merge(1, 100, false), 0, [])
+//         Ok(next) => println("${next.sources}")
+//         Err(_)   => println("no such source")
+// ```
+pub fn feed(m: LsmMerge, source: Int,
+            es: [lsmmem.LsmEntry]) -> Result<LsmMerge, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmmerge.feed")
+
+// `m` with source `i` closed: it has no more entries.
+//
+// A merge whose sources are all closed and drained answers
+// `LsmMergeDone`.  Closing is separate from feeding an empty list
+// because the two mean different things — "nothing right now" and
+// "nothing ever" — and a merge that treated an empty feed as a close
+// would finish early on a slow reader.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     match lsmmerge.close(lsmmerge.merge(1, 100, false), 0)
+//         Ok(next) => println("${next.sources}")
+//         Err(_)   => println("no such source")
+// ```
+pub fn close(m: LsmMerge, source: Int) -> Result<LsmMerge, lsmerror.LsmFault> []
+    todo("lsm-nv.lsmmerge.close")
+
+// True when every source is closed and drained.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.is_done(lsmmerge.merge(1, 100, false))}")
+// ```
+pub fn is_done(m: LsmMerge) -> Bool []
+    todo("lsm-nv.lsmmerge.is_done")
+
+// Which source the merge is waiting for, or `-1` when it is not
+// waiting.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.waiting_for(lsmmerge.merge(1, 100, false))}")
+// ```
+pub fn waiting_for(m: LsmMerge) -> Int []
+    todo("lsm-nv.lsmmerge.waiting_for")
+
+// Whether `e` would be dropped by a merge in state `m` — the
+// decision, asked without stepping.
+//
+// Published because it is the one function in the package whose being
+// wrong is invisible: a version dropped too early is a read that
+// answers the wrong value, and a tombstone dropped too early is a
+// deleted key that comes back.  A test that could only observe this
+// through `step` would be a test that had to reconstruct the state; a
+// store that wanted to count what a compaction reclaimed would have to
+// run it twice.
+//
+// ```novo
+// use lsmmem
+// use lsmmerge
+//
+// fn main() [io]
+//     let m = lsmmerge.merge(1, 100, false)
+//     println("${lsmmerge.would_drop(m, lsmmem.put([], [], 1))}")
+// ```
+pub fn would_drop(m: LsmMerge, e: lsmmem.LsmEntry) -> Bool []
+    todo("lsm-nv.lsmmerge.would_drop")
+
+// Why `would_drop` answered as it did, as one line.
+//
+// ```novo
+// use lsmmem
+// use lsmmerge
+//
+// fn main() [io]
+//     let m = lsmmerge.merge(1, 100, false)
+//     println(lsmmerge.drop_reason(m, lsmmem.put([], [], 1)))
+// ```
+pub fn drop_reason(m: LsmMerge, e: lsmmem.LsmEntry) -> Str []
+    todo("lsm-nv.lsmmerge.drop_reason")
+
+// The whole merge run to completion over lists the caller already
+// holds, in order.
+//
+// The convenience for a caller whose sources are in memory — a flush
+// of several memtables, a test, a small compaction.  It is
+// `step`/`feed`/`close` in a loop and it does not replace them,
+// because a caller compacting a gigabyte still needs the state
+// machine.
+//
+// ```novo
+// use std.list
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${list.len(lsmmerge.merge_all([], 100, false))}")
+// ```
+pub fn merge_all(sources: [[lsmmem.LsmEntry]], oldest_snapshot: Int,
+                 drop_tombstones: Bool) -> [lsmmem.LsmEntry] []
+    todo("lsm-nv.lsmmerge.merge_all")
+
+// The newest entry for `key` across `sources`, newest source first, or
+// `None`.
+//
+// The read path in one call, for a caller that has already fetched the
+// candidate entries from every table on `lsmlevel.read_path`.  Answers
+// the ENTRY, tombstone included — a caller that treated a tombstone as
+// a miss would go on to consult the level below and find the older
+// value the tombstone exists to hide.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     match lsmmerge.newest_of([], [], 99)
+//         Some(_) => println("found")
+//         None    => println("miss")
+// ```
+pub fn newest_of(sources: [[lsmmem.LsmEntry]], key: [u8], at_seq: Int) -> ?lsmmem.LsmEntry []
+    todo("lsm-nv.lsmmerge.newest_of")
+
+// True when `e` is what a reader should be handed: a put, not covered
+// by a range tombstone at a higher sequence.
+//
+// The last step of a read, and the one a caller writes wrongly by
+// forgetting range tombstones — a key hidden by a range delete has no
+// tombstone of its own anywhere, so nothing in the point-lookup path
+// mentions it.
+//
+// ```novo
+// use lsmmem
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.is_visible(lsmmem.put([], [], 1), [])}")
+// ```
+pub fn is_visible(e: lsmmem.LsmEntry, ranges: [lsmmem.LsmEntry]) -> Bool []
+    todo("lsm-nv.lsmmerge.is_visible")
+
+// The range tombstones in `es`, in key order — what a reader collects
+// from every table it consults before deciding what is visible.
+//
+// ```novo
+// use std.list
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${list.len(lsmmerge.range_tombstones_of([]))}")
+// ```
+pub fn range_tombstones_of(es: [lsmmem.LsmEntry]) -> [lsmmem.LsmEntry] []
+    todo("lsm-nv.lsmmerge.range_tombstones_of")
+
+// How many entries the merge has emitted.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.emitted(lsmmerge.merge(1, 100, false))}")
+// ```
+pub fn emitted(m: LsmMerge) -> Int []
+    todo("lsm-nv.lsmmerge.emitted")
+
+// How many entries the merge has dropped as superseded or as expired
+// tombstones.
+//
+// The number a compaction reports as what it reclaimed, and the one
+// that says whether a level's tombstone pressure was worth compacting
+// for.
+//
+// ```novo
+// use lsmmerge
+//
+// fn main() [io]
+//     println("${lsmmerge.dropped(lsmmerge.merge(1, 100, false))}")
+// ```
+pub fn dropped(m: LsmMerge) -> Int []
+    todo("lsm-nv.lsmmerge.dropped")

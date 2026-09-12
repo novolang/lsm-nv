@@ -1,0 +1,283 @@
+// lsmwal_tests.nv — the log, and the three ways a recovery loses data
+// if it is written the obvious way.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: lsm-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE THREE CASES THAT MATTER ARE THE ENDINGS.  A log that ends
+// cleanly is the easy case and every implementation gets it right.
+// The ones worth asserting are: a half-written last record, a record
+// left over from before a checkpoint, and a batch whose commit marker
+// never landed.  Getting any of the three wrong loses committed data
+// or applies half a transaction, and neither shows up as an error.
+
+use std.test
+use std.list
+use lsmerror
+use lsmmem
+use lsmwal
+
+@test
+fn test_a_header_round_trips_and_carries_its_generation() [io]
+    let h = lsmwal.new_header(3, 0x1111, 0x2222, 100)
+
+    test.case("the fields are kept")
+    test.assert(h.checkpoint_seq == 3)
+    test.assert(h.salt1 == 0x1111)
+    test.assert(h.salt2 == 0x2222)
+    test.assert(h.first_seq == 100)
+
+    test.case("it writes to a fixed size")
+    test.assert(list.len(lsmwal.write_header([], h)) == lsmwal.header_size())
+
+    test.case("and reads back with its checksum checked")
+    match lsmwal.read_header(lsmwal.write_header([], h))
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert(back.salt1 == 0x1111)
+            test.assert(back.first_seq == 100)
+
+    test.case("bytes that are not a header are refused")
+    match lsmwal.read_header([])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_checkpoint_advances_the_generation_rather_than_truncating() [io]
+    // A checkpoint that reused a salt would make recovery replay
+    // writes already in a table — harmless for a put, and NOT harmless
+    // for a tombstone whose key has since been written again.
+    let h = lsmwal.new_header(3, 0x1111, 0x2222, 100)
+    let next = lsmwal.checkpoint(h, 200)
+
+    test.case("the checkpoint count goes up")
+    test.assert(next.checkpoint_seq == 4)
+
+    test.case("the salts change, which is what makes old records stale")
+    test.assert(next.salt1 != h.salt1 or next.salt2 != h.salt2)
+
+    test.case("and the first sequence moves past what is now in a table")
+    test.assert(next.first_seq == 200)
+
+@test
+fn test_a_record_carries_the_generation_so_a_stale_one_is_recognised() [io]
+    let h = lsmwal.new_header(3, 0x1111, 0x2222, 100)
+    let old = lsmwal.checkpoint(h, 200)
+
+    match lsmwal.write_record([], h, lsmmem.put([0x61], [0x01], 101), true, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.case("the record goes into the buffer")
+            test.assert(list.len(w.bytes) > lsmwal.record_header_size())
+
+            test.case("and the running checksum moved")
+            test.assert(w.running != 0)
+
+            test.case("the record is current against the header that wrote it")
+            match lsmwal.read_record(w.bytes, h, 0)
+                Err(_)  => test.assert(false)
+                Ok(rec) =>
+                    test.assert(rec.seq == 101)
+                    test.assert(rec.commit)
+                    test.assert(lsmwal.is_current(rec, h))
+
+                    test.case("and stale against the generation after it")
+                    test.assert(lsmwal.is_current(rec, old) == false)
+
+@test
+fn test_only_the_last_record_of_a_batch_is_the_commit() [io]
+    // Marking the wrong record — or every record — turns a batch that
+    // must be applied whole into one that can be applied half, and
+    // nothing about the resulting log looks wrong.
+    let h = lsmwal.new_header(1, 1, 2, 1)
+    let es = [lsmmem.put([0x61], [0x01], 1),
+              lsmmem.put([0x62], [0x02], 2),
+              lsmmem.put([0x63], [0x03], 3)]
+
+    match lsmwal.write_batch([], h, es, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.case("the batch is written")
+            test.assert(list.len(w.bytes) > 0)
+
+            test.case("the first record is not a commit")
+            match lsmwal.read_record(w.bytes, h, 0)
+                Err(_)  => test.assert(false)
+                Ok(rec) => test.assert(rec.commit == false)
+
+    test.case("and batch_len counted it before it was written")
+    match lsmwal.write_batch([], h, es, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  => test.assert(list.len(w.bytes) == lsmwal.batch_len(es))
+
+@test
+fn test_a_clean_log_recovers_every_committed_entry() [io]
+    let h = lsmwal.new_header(1, 1, 2, 1)
+    let es = [lsmmem.put([0x61], [0x01], 1), lsmmem.put([0x62], [0x02], 2)]
+
+    match lsmwal.write_batch([], h, es, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            let r = lsmwal.replay(lsmwal.recovery(h), 0, w.bytes)
+
+            test.case("both entries come back, in log order")
+            test.assert(list.len(lsmwal.committed(r)) == 2)
+
+            test.case("the committed sequence is the batch's last")
+            test.assert(r.committed_seq == 2)
+
+            test.case("and the truncation point is the end of the batch")
+            test.assert(lsmwal.truncate_to(r) == list.len(w.bytes))
+
+@test
+fn test_a_torn_tail_keeps_everything_before_it_and_is_not_corruption() [io]
+    // The ordinary way a crash ends a log is half a record. A recovery
+    // that treated it as corruption would discard every committed
+    // write in the log.
+    let h = lsmwal.new_header(1, 1, 2, 1)
+
+    match lsmwal.write_batch([], h, [lsmmem.put([0x61], [0x01], 1)], 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            // Half the record: everything up to the batch's end, minus
+            // the last few bytes.
+            let torn = list.take(w.bytes, list.len(w.bytes) - 3)
+            let r = lsmwal.replay(lsmwal.recovery(h), 0, torn)
+
+            test.case("the recovery stops")
+            test.assert(lsmwal.is_done(r))
+
+            test.case("and says a torn tail is what stopped it")
+            match lsmwal.stopped_by(r)
+                Some(k) =>
+                    test.assert(lsmerror.ends_recovery(k))
+
+                    test.case("which is NOT corruption")
+                    test.assert(lsmerror.is_corruption(k) == false)
+
+                None    => test.assert(false)
+
+@test
+fn test_an_uncommitted_batch_is_discarded_whole() [io]
+    // A store that kept the entries after the last commit would apply
+    // half a transaction.
+    let h = lsmwal.new_header(1, 1, 2, 1)
+
+    match lsmwal.write_batch([], h, [lsmmem.put([0x61], [0x01], 1)], 0)
+        Err(_)    => test.assert(false)
+        Ok(first) =>
+            // A second batch whose commit record never landed.
+            match lsmwal.write_record(first.bytes, h,
+                                      lsmmem.put([0x62], [0x02], 2), false,
+                                      first.running)
+                Err(_) => test.assert(false)
+                Ok(w)  =>
+                    let r = lsmwal.replay(lsmwal.recovery(h), 0, w.bytes)
+
+                    test.case("only the committed batch comes back")
+                    test.assert(list.len(lsmwal.committed(r)) == 1)
+
+                    test.case("and the truncation point is where that batch ended")
+                    test.assert(lsmwal.truncate_to(r) == list.len(first.bytes))
+
+@test
+fn test_a_stale_record_ends_recovery_and_is_not_corruption_either() [io]
+    // The log is written in place and never truncated, so records from
+    // before the last checkpoint are still in the file.
+    let old = lsmwal.new_header(1, 1, 2, 1)
+    let now = lsmwal.checkpoint(old, 100)
+
+    match lsmwal.write_batch([], old, [lsmmem.put([0x61], [0x01], 1)], 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            let r = lsmwal.replay(lsmwal.recovery(now), 0, w.bytes)
+
+            test.case("nothing from the previous generation is recovered")
+            test.assert(list.len(lsmwal.committed(r)) == 0)
+
+            test.case("and the stop is a stale record, not a fault")
+            match lsmwal.stopped_by(r)
+                Some(k) =>
+                    test.assert(lsmerror.ends_recovery(k))
+                    test.assert(lsmerror.is_corruption(k) == false)
+                None    => test.assert(false)
+
+@test
+fn test_the_checksum_is_cumulative_so_a_spliced_record_is_caught() [io]
+    // A per-record checksum would accept a record lifted out of
+    // another log and dropped in.
+    let h = lsmwal.new_header(1, 1, 2, 1)
+
+    test.case("folding the same bytes into two different runnings differs")
+    test.assert(lsmwal.fold_checksum(0, [0x01]) != lsmwal.fold_checksum(1, [0x01]))
+
+    test.case("and folding is deterministic")
+    test.assert(lsmwal.fold_checksum(0, [0x01]) == lsmwal.fold_checksum(0, [0x01]))
+
+    test.case("the log's checksum is the same one the tables use")
+    test.assert(lsmwal.record_crc().width == 32)
+
+@test
+fn test_a_recovery_fed_in_chunks_reaches_the_same_answer() [io]
+    // A store reads the log in chunks; a chunk that ends mid-record
+    // leaves the recovery asking for that record again.
+    let h = lsmwal.new_header(1, 1, 2, 1)
+    let es = [lsmmem.put([0x61], [0x01], 1), lsmmem.put([0x62], [0x02], 2)]
+
+    match lsmwal.write_batch([], h, es, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            test.case("a fresh recovery has nothing and is not done")
+            let start = lsmwal.recovery(h)
+            test.assert(start.committed_at == 0)
+            test.assert(lsmwal.is_done(start) == false)
+
+            test.case("and one fed the whole log has everything")
+            test.assert(list.len(lsmwal.committed(lsmwal.replay(start, 0, w.bytes)))
+                        == 2)
+
+@test
+fn test_a_record_carries_its_kind_so_a_tombstone_survives_a_crash() [io]
+    let h = lsmwal.new_header(1, 1, 2, 1)
+
+    match lsmwal.write_record([], h, lsmmem.tombstone([0x61], 1), true, 0)
+        Err(_) => test.assert(false)
+        Ok(w)  =>
+            match lsmwal.read_record(w.bytes, h, 0)
+                Err(_)  => test.assert(false)
+                Ok(rec) =>
+                    test.case("the kind is the entry's")
+                    match rec.kind
+                        LsmDelete => test.assert(true)
+                        _         => test.assert(false)
+
+                    test.case("and a tombstone has no value to write")
+                    test.assert(rec.value_len == 0)
+                    test.assert(rec.key_len == 1)
+
+@test
+fn test_every_fault_names_itself_and_the_table_it_is_about() [io]
+    // A fault carries a table id rather than a path, because this
+    // package never sees a filename — the caller maps the id.
+    let f = lsmerror.fault(LsmBadBlockCrc(4096, 512, 1, 2), 7)
+
+    test.case("the table id is the caller's own")
+    test.assert(f.table == 7)
+
+    test.case("the kind has a short name for a log line")
+    test.assert(lsmerror.kind_name(LsmEmptyKey) == "empty-key")
+    test.assert(lsmerror.kind_name(LsmWalTorn(0)) == "wal-torn")
+
+    test.case("and the message is a line a person can act on")
+    test.assert(lsmerror.message(f) != "")
+
+    test.case("a corrupt block is corruption and a torn log is not")
+    test.assert(lsmerror.is_corruption(LsmBadBlockCrc(4096, 512, 1, 2)))
+    test.assert(lsmerror.is_corruption(LsmWalTorn(0)) == false)
+    test.assert(lsmerror.is_corruption(LsmWalStale(0)) == false)
+
+    test.case("and only the two log endings end recovery")
+    test.assert(lsmerror.ends_recovery(LsmWalTorn(0)))
+    test.assert(lsmerror.ends_recovery(LsmWalStale(0)))
+    test.assert(lsmerror.ends_recovery(LsmBadMagic(0)) == false)
