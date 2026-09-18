@@ -80,6 +80,20 @@ pub struct LsmFault
     // filename; this package never sees one.
     table: Int
 
+// `LsmFault` is an `Error`, which is what lets `Result<T, LsmFault>`
+// exist at all — every fallible signature in `lsmmem`, `lsmsst`,
+// `lsmwal`, `lsmlevel` and `lsmmerge` answers with one.
+impl Error for LsmFault
+    // The one-line message: `lsmerror.message`'s sentence, the kind's
+    // name with the table it is about and the offset in it.
+    //
+    // It names a table id and not a filename, for the reason the
+    // module comment gives: this package never sees one.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("lsm-nv.LsmFault.message")
+
 // A fault, built.
 //
 // ```novo
