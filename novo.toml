@@ -1,6 +1,6 @@
 [package]
 name        = "lsm-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "A log-structured merge tree as arithmetic over blocks the caller stores: a sorted memtable, an SSTable format with blocks, an index, a bloom filter and a crc-nv footer written into a caller's buffer, a reader that asks for byte ranges instead of reading them, a manifest of levels with a compaction planner, a merge iterator fed by the caller, and a write-ahead log whose recovery stops in the right place.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

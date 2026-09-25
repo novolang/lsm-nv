@@ -5,6 +5,17 @@ All notable changes to lsm-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-25
+
+The package builds with novo 0.11.  Every body is still `todo()`.
+
+- The lock file moves crc-nv 0.1.4 to 0.1.5, leb128-nv 0.1.5 to 0.1.7,
+  varint-nv 0.1.4 to 0.1.6 and zigzag-nv 0.1.4 to 0.1.5.  leb128-nv
+  0.1.5 and varint-nv 0.1.4 write into lists through names that are not
+  declared `var`, which novo 0.11 refuses (E2038), so this package did
+  not build with novo 0.11 against them.  No requirement in the manifest
+  changed.
+
 ## 0.0.2 — 2026-09-15
 
 - README rewritten to the package README style guide (docs/writing-a-readme.md).
